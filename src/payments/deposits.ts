@@ -87,6 +87,8 @@ export async function createDeposit(
   idempotencyKey: string,
   req: DepositRequest,
   appBaseUrl: string,
+  /** Where Checkout sends the browser back to. Default: GET /deposits/:id on the API. */
+  returnUrl?: string,
 ): Promise<{ deposit: Deposit; replayed: boolean }> {
   const requestHash = hashDepositRequest(req);
 
@@ -129,8 +131,12 @@ export async function createDeposit(
         depositId: row.id,
         amountCents: row.amount_cents,
         currency: row.currency,
-        successUrl: `${appBaseUrl}/deposits/${row.id}?checkout=success`,
-        cancelUrl: `${appBaseUrl}/deposits/${row.id}?checkout=cancelled`,
+        successUrl: returnUrl
+          ? `${returnUrl}?deposit=${row.id}&checkout=success`
+          : `${appBaseUrl}/deposits/${row.id}?checkout=success`,
+        cancelUrl: returnUrl
+          ? `${returnUrl}?deposit=${row.id}&checkout=cancelled`
+          : `${appBaseUrl}/deposits/${row.id}?checkout=cancelled`,
       },
       `deposit-checkout:${row.id}`,
     );
