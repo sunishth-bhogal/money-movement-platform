@@ -97,7 +97,7 @@ export function buildApp(
   app.post("/transfers", async (req, reply) => {
     const key = requireIdempotencyKey(req.headers["idempotency-key"]);
     const body = transferBody.parse(req.body);
-    const { transfer, replayed } = await createTransfer(pool, key, body);
+    const { transfer, replayed } = await createTransfer(pool, key, body, { scope: "api" });
 
     if (replayed) reply.header("Idempotent-Replayed", "true");
     if (transfer.status === "rejected") {

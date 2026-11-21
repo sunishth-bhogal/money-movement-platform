@@ -17,6 +17,6 @@ await createTransfer(pool, `seed-${randomUUID()}`, {
   to_account_id: alice.id,
   amount_cents: 5000,
   currency: "USD",
-});
+}, { scope: "system" });
 console.log(JSON.stringify({ funding: funding.id, alice: alice.id, bob: bob.id }, null, 2));
 await pool.end();

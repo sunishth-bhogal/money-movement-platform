@@ -4,9 +4,10 @@ A fictional money movement platform built in stages, with a focus on one thing:
 **staying correct when requests are duplicated, raced, or lost.**
 
 So far: accounts, an immutable double-entry ledger, an internal `POST /transfers`
-endpoint that is idempotent and safe under concurrency, and deposits through
-**Stripe Checkout in test mode**, credited only by a verified webhook. The outbox
-worker, a mock bank connector, and reconciliation come next (see
+endpoint that is idempotent and safe under concurrency, deposits through
+**Stripe Checkout in test mode**, credited only by a verified webhook, and a
+**transactional outbox** with a worker that publishes every money movement with
+retries and backoff. A mock bank connector and reconciliation come next (see
 [Roadmap](#roadmap)). All money and accounts are fictional, and Stripe is only
 ever used in test mode.
 
@@ -24,12 +25,14 @@ export DATABASE_URL=postgres://postgres:postgres@localhost:5432/money_dev
 
 npm run seed        # funding account + Alice ($50.00) + Bob; prints their ids
 npm run dev         # API on http://localhost:3000
+npm run worker      # outbox worker: prints events (or POSTs them to OUTBOX_WEBHOOK_URL)
 
 # tests run against a real Postgres (money_test), not mocks
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/money_test npm test
 ```
 
-Or run the API and database together with `docker compose up --build`.
+Or run the API, the worker and the database together with `docker compose up --build`
+(add `--scale worker=3` to run several workers side by side).
 
 The tests need no Stripe account: webhook signatures are generated with Stripe's
 SDK against a throwaway secret, and the Checkout API is faked.
@@ -96,6 +99,7 @@ went from 5000 to 4000 exactly once.
 | `422 idempotency_key_reused` | The key was already used with a different body. Nothing changed. |
 | `422 currency_mismatch` | Account currency differs from the request. |
 | `400` | Missing key or invalid body (e.g. `amount_cents: 10.5`). |
+| `403 system_account_not_allowed` | Either account is a system account. Only internal code moves money out of those. |
 | `404` | An account does not exist. |
 
 A replay returns the original status code and body, plus `Idempotent-Replayed: true`.
@@ -104,11 +108,13 @@ A replay returns the original status code and body, plus `Idempotent-Replayed: t
 
 ```
 accounts          id, name, currency, kind (user|system), balance_cents
-transfers         id, idempotency_key UNIQUE, request_hash, from/to, amount_cents, status (posted|rejected)
+transfers         id, (idempotency_scope, idempotency_key) UNIQUE, request_hash, from/to, amount_cents, status (posted|rejected)
 ledger_entries    id, transfer_id, account_id, amount_cents (signed), currency   -- append-only
 processed_events  (provider, event_id) PRIMARY KEY, event_type, payload          -- webhook inbox
 deposits          id, idempotency_key UNIQUE, account_id, amount_cents, status,
                   stripe_checkout_session_id UNIQUE, transfer_id UNIQUE           -- Stripe Checkout state
+outbox            id, event_id UNIQUE, event_type, aggregate_type/id, payload,
+                  status (pending|published|dead), attempts, next_attempt_at, claim_token
 ```
 
 See [`migrations/`](migrations/).
@@ -184,7 +190,29 @@ test and both deadlock tests fail.
 ### Idempotency: what if the database commits but the response is lost?
 
 The client retries with the same `Idempotency-Key` and gets back the original
-result. Money moves once.
+result. Money moves once. And whether or not the client ever retries, exactly
+one outbox event announces the transfer (see [the outbox](#the-transactional-outbox)).
+
+The response can be lost in two different places, and
+[`test/reliability.test.ts`](test/reliability.test.ts) tests both against a real
+HTTP server and Postgres:
+
+1. **After COMMIT, on the way to the client.** The server built its `201` but
+   the connection dropped (a proxy timeout, a phone losing signal). The client
+   sees a network error. The test destroys the socket in an `onSend` hook, which
+   runs after the transaction committed, then checks the money moved, retries,
+   and gets `201` with `Idempotent-Replayed: true`, the same transfer id, one
+   transfer row, unchanged balances and one `transfer.posted` event.
+2. **During COMMIT, on the way back from Postgres.** COMMIT succeeded, but the
+   acknowledgement never reached the server, so *the server itself* does not
+   know the outcome. It answers `500`, which is honest: it must not claim
+   failure for something that may have happened. The test runs COMMIT for real
+   and then reports a dropped connection. The retry (on a healthy instance)
+   finds the committed row and replays it.
+
+In both cases the client cannot tell whether money moved, and does not need to:
+the retry is safe either way. A `500` from this endpoint always means "unknown,
+retry with the same key", never "definitely did not happen".
 
 - **One transaction is the whole operation.** The transfer row, which *is* the
   idempotency record, commits in the same transaction as the ledger entries. So
@@ -214,11 +242,128 @@ result. Money moves once.
   (`UNIQUE (client_id, idempotency_key)`).
 - Keys never expire. Stripe keeps them for 24h. Here the transfer row doubles as
   the record, so keeping it forever costs nothing extra.
-- This only works because the transfer touches nothing but Postgres. Once a step
-  calls Stripe or a bank (stage 3), a single transaction can't cover the side
-  effect. That needs a recorded state machine with recovery points plus an
-  outbox, so external calls are retried from durable state rather than from
-  memory.
+- This only works because the transfer touches nothing but Postgres. Anything
+  that must happen *outside* Postgres because of a transfer goes through the
+  outbox, which is retried from durable state rather than from memory. Calls to
+  Stripe that happen *before* the money moves (opening Checkout) use the
+  recorded deposit state machine instead.
+
+**Gaps closed in stage 3:**
+
+- **Client keys could collide with internal ones.** The deposit webhook posts
+  its ledger transfer under the key `deposit:<deposit id>`, and the deposit id is
+  in the client's own `POST /deposits` response. Keys were one global namespace,
+  so a client could send `deposit:<id>` as its *own* `Idempotency-Key` first
+  (even a rejected transfer stores the key). The webhook would then hit "key
+  reused with a different body", return `500` on every Stripe retry, and the
+  deposit could never be credited. Keys now have a scope:
+  `UNIQUE (idempotency_scope, idempotency_key)`, with `api` for client keys and
+  `system` for keys built by our code. Migration `003` moves existing deposit
+  transfers to `system`.
+- **The public API could move money out of system accounts.** System accounts
+  may go negative, so `POST /transfers` from the Stripe clearing account would
+  have minted money. `api`-scoped transfers now require both accounts to be
+  `user` accounts (`403 system_account_not_allowed`). Internal code (the
+  webhook, the seed script) uses the `system` scope.
+
+### The transactional outbox
+
+**The problem.** When money moves, other systems need to hear about it: a
+notification service, a partner's webhook, analytics, later the bank connector.
+The obvious code is "commit, then publish", and it has two failure modes. If the
+process dies between the two, the transfer happened and nobody is ever told. If
+you publish first and the commit then fails, you announced a transfer that does
+not exist. No amount of `try`/`catch` fixes this, because a crash skips both.
+
+**The fix.** Don't publish from the request at all. Write the event as a row in
+the `outbox` table **inside the same transaction** as the ledger change
+([`createTransferInTx`](src/ledger/transfers.ts) and the deposit webhook do
+this). The event now exists if and only if the change committed. A separate
+worker reads the table and does the publishing, after commit, with retries.
+
+Events written today: `transfer.posted`, `transfer.rejected`, and
+`deposit.<status>` (`succeeded`, `processing`, `failed`, `expired`,
+`requires_review`). A credited deposit writes both `transfer.posted` and
+`deposit.succeeded` in its one transaction. A replayed request writes nothing.
+
+**The worker** ([`src/outbox/worker.ts`](src/outbox/worker.ts), `npm run worker`)
+polls in three short, separate statements, and never holds a transaction open
+during the network call. (A transaction open across a slow HTTP call holds row
+locks and a pooled connection for as long as the slowest destination takes.)
+
+1. **Claim.** `SELECT ... WHERE status = 'pending' AND next_attempt_at <= now()
+   ... FOR UPDATE SKIP LOCKED`, then in the same statement bump `attempts`, set a
+   fresh `claim_token`, and push `next_attempt_at` forward by the lease (60s by
+   default). Commit.
+2. **Publish**, outside any transaction, with a timeout shorter than the lease.
+3. **Complete.** Mark `published`, or schedule a retry, or mark `dead`, but only
+   `WHERE claim_token = <ours>`.
+
+**Running many workers.** `FOR UPDATE SKIP LOCKED` makes concurrent workers step
+over rows another worker is claiming at that instant, rather than queueing
+behind its lock or claiming the row twice. Once a claim commits, the row's
+`next_attempt_at` is in the future, so no other worker sees it as due. Workers
+share nothing but Postgres, so you can run any number of them, in any number of
+processes. A test runs 6 workers against 300 events and checks each is delivered
+exactly once; removing `SKIP LOCKED` makes it fail with duplicate deliveries.
+
+**What if a worker crashes mid-publish?** There's no `in_progress` status to get
+stuck in: the claim *is* a lease, stored in `next_attempt_at`. If the worker
+dies, the lease runs out and the row is simply due again, and another worker
+picks it up. Two cases, both tested:
+
+- **Crash before publishing.** The next worker publishes it. One delivery.
+- **Crash after the destination accepted it, but before writing `published`.**
+  From the database's side this looks exactly like the first case, so the event
+  is published again. This is the outbox's own version of "committed but the
+  response was lost", and it can't be avoided: no system can atomically update
+  Postgres *and* someone else's server. So **delivery is at-least-once**, and
+  every event carries a stable `event_id` (sent as the `Idempotency-Key` header
+  by the HTTP publisher). Consumers deduplicate on it, exactly like our own
+  webhook does with Stripe's event ids. The test asserts two deliveries, one
+  applied effect.
+
+**Fencing.** A worker can stall rather than die (a long GC pause, a frozen VM),
+lose its lease, and wake up while another worker is mid-publish. Completing
+requires the `claim_token` the worker was given at claim time, and a new claim
+issues a new token, so the stale worker's late "failed" or "published" matches
+nothing and is dropped. The publish timeout must be shorter than the lease (the
+constructor refuses otherwise), so a *healthy* worker never loses a row it is
+still working on.
+
+**Retries and backoff.** A failed publish is retried after an exponential delay
+with jitter: `window = min(maxDelay, base × 2^(attempt−1))`, and the delay is a
+random point in `[window/2, window]`. The fixed half guarantees a real pause; the
+random half stops a crowd of events that failed at the same moment (a
+downstream outage) from all retrying in lockstep and knocking it over again.
+Defaults: base 1s, cap 10 min, 10 attempts.
+
+**Retry exhaustion.** After `maxAttempts`, the event goes to `dead` with its
+`last_error` kept, and is never tried again on its own. Three things lead
+there: running out of attempts; a `PermanentPublishError` from the publisher
+(the HTTP publisher raises it for 4xx other than 408 and 429, since resending the
+same bad request can't help); or a worker crashing on the final attempt (the
+lease expires and the row is retired instead of being tried an 11th time). A
+crash counts as an attempt, so an event that crashes the worker every time ("a
+poison message") can't loop forever. `requeueDeadEvent()` puts a dead event back
+with a fresh budget once someone has fixed the cause.
+
+**Known limits, deliberately deferred:**
+
+- **No ordering guarantee.** Parallel workers, retries and backoff mean
+  `transfer.posted` for one transfer can arrive after a later one. Consumers
+  that need order should use `aggregate_id` plus the payload's timestamps, or
+  we'd need per-aggregate sequencing, which costs throughput.
+- **Polling, not push.** An idle worker polls every second. `LISTEN/NOTIFY`
+  would cut latency, but polling is needed anyway as the fallback, so it comes
+  first.
+- **Published rows are kept forever.** At real volume, a job would delete or
+  archive published rows after a retention window. The partial index means
+  they don't slow the worker down meanwhile.
+- **Outgoing HTTP events are not signed yet.** A receiver can't yet verify they
+  came from us. That would be an HMAC header, like Stripe's.
+- **Dead events need a person.** There is no admin endpoint or alert for them
+  yet. That belongs with the reconciliation dashboard.
 
 ### Webhook deduplication
 
@@ -302,9 +447,11 @@ reconciliation (stage 5) will compare against Stripe's balance.
 
 - Refunds, disputes and chargebacks are not handled yet. They will be reversing
   transfers out of the user account.
-- Handling is synchronous inside the webhook request. That is fine at this
-  volume. Stage 3 moves the work behind an inbox/outbox so the endpoint only
-  records and acknowledges.
+- Handling is synchronous inside the webhook request. `processed_events` is
+  already the inbox (dedup in the same transaction as the effects), and
+  anything that must reach the outside world after a credit goes through the
+  outbox. Splitting "record and acknowledge" from "apply" only pays off once
+  applying gets slow, which it isn't yet.
 - If webhooks stop arriving altogether (endpoint misconfigured, outage), deposits
   stay `pending`. A sweeper that asks Stripe about old `pending` sessions belongs
   with reconciliation.
@@ -329,6 +476,19 @@ The tests run against real PostgreSQL. Concurrency bugs don't show up against mo
 | Does the success page move money? | `landing on the success page changes nothing` |
 | Stripe times out while creating Checkout? | `if Stripe fails, the deposit stays 'created' and a retry reuses the same Stripe idempotency key` |
 | Stripe charged a different amount? | `a paid amount that differs from the deposit is held for review, not credited` |
+| **DB commits, connection drops before the response?** | `the connection drops after commit: the retry returns the original transfer, and money moves once` |
+| **COMMIT succeeds, its acknowledgement is lost?** | `COMMIT succeeds but its acknowledgement is lost: the server answers 500, and the retry finds the committed transfer` |
+| Client never retries: does anyone hear about the transfer? | `even if the client never retries, downstream still hears about the transfer exactly once` |
+| Event without the change, or change without the event? | `if the transaction rolls back, neither the transfer nor its event exists`, `a replayed request does not write a second event` |
+| Worker crashes before publishing? | `crash after claiming, before publishing: the lease expires and another worker publishes it` |
+| Worker crashes after publishing, before recording it? | `crash after publishing, before recording it: the event is delivered again, and the consumer applies it once` |
+| A stalled worker wakes up late? | `a worker that stalls past its lease cannot overwrite the worker that took over (fencing)` |
+| Many workers at once? | `6 workers draining 300 events at once deliver each event exactly once` |
+| Flaky destination? | `with a flaky destination (30% of calls fail), every event is still accepted exactly once` |
+| Retries run out? | `retries with growing delays, then marks the event dead after maxAttempts`, `a crash on the final attempt retires the event as dead` |
+| Destination hangs? | `a publish that hangs is timed out and retried, without waiting for the lease` |
+| A client squats an internal idempotency key? | `a client that sends deposit:<id> as its own Idempotency-Key cannot block the deposit from being credited` |
+| A client moves money out of a system account? | `the public API cannot move money out of a system account` |
 
 CI (GitHub Actions) runs the typecheck and the full suite against a Postgres 16 service container.
 
@@ -336,7 +496,7 @@ CI (GitHub Actions) runs the typecheck and the full suite against a Postgres 16 
 
 1. ✅ **Internal transfers:** accounts, double-entry ledger, `POST /transfers`, idempotency, concurrency.
 2. ✅ **Payments:** Stripe test Checkout, a verified webhook, and a deposit posted from the webhook (not from the success page).
-3. **Reliability:** an outbox worker, retries with backoff, and webhook processing moved behind an inbox.
+3. ✅ **Reliability:** a transactional outbox, a concurrent-safe worker with retries and backoff, and idempotency-key scopes.
 4. **Bank connector:** a mock provider with delayed success, failures, duplicate webhooks, and outages.
 5. **Reconciliation:** compare the ledger against provider records, with an admin dashboard for unmatched items.
 6. **Dashboard:** a small React UI for balances and history.

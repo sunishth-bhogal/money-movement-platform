@@ -5,6 +5,7 @@ import { withTransaction } from "../db.js";
 import { ApiError } from "../errors.js";
 import { recordEventOnce } from "../ledger/events.js";
 import { createTransferInTx } from "../ledger/transfers.js";
+import { enqueueOutboxEvent } from "../outbox/outbox.js";
 import type { CheckoutGateway } from "./stripe.js";
 
 export type DepositStatus =
@@ -265,6 +266,21 @@ async function applyCheckoutSessionEvent(
         WHERE id = $1`,
       [deposit.id, status, extra.transferId ?? null, extra.reason ?? null, session.id, paymentIntentId],
     );
+    // Same transaction as the status change (and the ledger posting, if any).
+    await enqueueOutboxEvent(client, {
+      eventType: `deposit.${status}`,
+      aggregateType: "deposit",
+      aggregateId: deposit.id,
+      payload: {
+        id: deposit.id,
+        account_id: deposit.account_id,
+        amount_cents: deposit.amount_cents,
+        currency: deposit.currency,
+        status,
+        transfer_id: extra.transferId ?? null,
+        failure_reason: extra.reason ?? null,
+      },
+    });
     return { outcome: `deposit_${status}` as WebhookOutcome, deposit_id: deposit.id };
   };
 
@@ -280,12 +296,18 @@ async function applyCheckoutSessionEvent(
       });
     }
     const clearing = await stripeClearingAccount(client, deposit.currency);
-    const { transfer } = await createTransferInTx(client, `deposit:${deposit.id}`, {
-      from_account_id: clearing,
-      to_account_id: deposit.account_id,
-      amount_cents: deposit.amount_cents,
-      currency: deposit.currency,
-    });
+    // A `system`-scoped key: no API client can have used it first.
+    const { transfer } = await createTransferInTx(
+      client,
+      `deposit:${deposit.id}`,
+      {
+        from_account_id: clearing,
+        to_account_id: deposit.account_id,
+        amount_cents: deposit.amount_cents,
+        currency: deposit.currency,
+      },
+      { scope: "system" },
+    );
     return setStatus("succeeded", { transferId: transfer.id });
   }
   if (type === "checkout.session.completed") return setStatus("processing"); // async method (e.g. bank debit) pending
