@@ -7,7 +7,12 @@ import { createTransfer } from "../src/ledger/transfers.js";
 process.env.DATABASE_URL ??= "postgres://postgres:postgres@localhost:5432/money_test";
 
 export const pool = createPool();
-export const app = buildApp(pool);
+
+/** The core API needs a caller: tests act as an operator unless they say otherwise. */
+export const OPERATOR_TOKEN = "test-operator-token";
+export const AS_OPERATOR = { authorization: `Bearer ${OPERATOR_TOKEN}` };
+export const operatorAuth = { admin: { token: OPERATOR_TOKEN, providers: {} } };
+export const app = buildApp(pool, operatorAuth);
 
 /** A system account that can go negative. Funding moves out of it with a `system`-scoped transfer, as internal code would. */
 let funding: Promise<string> | undefined;
@@ -40,7 +45,7 @@ export function postTransfer(key: string | undefined, body: Record<string, unkno
   return app.inject({
     method: "POST",
     url: "/transfers",
-    headers: key === undefined ? {} : { "idempotency-key": key },
+    headers: key === undefined ? AS_OPERATOR : { ...AS_OPERATOR, "idempotency-key": key },
     payload: body,
   });
 }

@@ -10,10 +10,10 @@ import { OutboxWorker, type Publisher } from "../src/outbox/worker.js";
 import { bankIdempotencyKey, checkPayoutInvariants, getPayout, PAYOUT_SUBMIT_EVENT, type Payout } from "../src/payouts/payouts.js";
 import { reconcilePayouts } from "../src/payouts/reconcile.js";
 import { payoutSubmitter } from "../src/payouts/submitter.js";
-import { balanceOf, pool, userWithBalance } from "./helpers.js";
+import { AS_OPERATOR, balanceOf, operatorAuth, pool, userWithBalance } from "./helpers.js";
 
 const SECRET = "test_bank_webhook_secret";
-const app = buildApp(pool, { bankWebhookSecret: SECRET });
+const app = buildApp(pool, { ...operatorAuth, bankWebhookSecret: SECRET });
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 // Account numbers that pick the mock bank's behaviour (see src/bank/mockBank.ts).
@@ -94,7 +94,7 @@ function makeWorker(opts: ConstructorParameters<typeof OutboxWorker>[2] = {}) {
 }
 
 function requestPayout(key: string, body: Record<string, unknown>) {
-  return app.inject({ method: "POST", url: "/payouts", headers: { "idempotency-key": key }, payload: body });
+  return app.inject({ method: "POST", url: "/payouts", headers: { ...AS_OPERATOR, "idempotency-key": key }, payload: body });
 }
 
 async function payout(accountId: string, cents: number, accountNumber = SUCCEEDS): Promise<Payout> {
@@ -576,7 +576,7 @@ describe("over HTTP: the real API, the mock bank server, and the worker", () => 
   it("a payout travels API → outbox → bank → signed webhook → ledger, with a lost response and duplicate webhooks on the way", async () => {
     const { buildMockBankServer, httpWebhookDeliverer } = await import("../src/bank/mockBankServer.js");
     const { httpBankClient } = await import("../src/bank/client.js");
-    const api = buildApp(pool, { bankWebhookSecret: SECRET });
+    const api = buildApp(pool, { ...operatorAuth, bankWebhookSecret: SECRET });
     const apiUrl = await api.listen({ port: 0, host: "127.0.0.1" });
     const remote = new MockBank({
       deliver: httpWebhookDeliverer(`${apiUrl}/webhooks/bank`, SECRET),
@@ -594,7 +594,7 @@ describe("over HTTP: the real API, the mock bank server, and the worker", () => 
       const alice = await userWithBalance(5000);
       const res = await fetch(`${apiUrl}/payouts`, {
         method: "POST",
-        headers: { "content-type": "application/json", "idempotency-key": randomUUID() },
+        headers: { ...AS_OPERATOR, "content-type": "application/json", "idempotency-key": randomUUID() },
         body: JSON.stringify({ account_id: alice, amount_cents: 1234, currency: "USD", bank_account_number: SUCCEEDS }),
       });
       const p = (await res.json()) as Payout;
@@ -607,7 +607,7 @@ describe("over HTTP: the real API, the mock bank server, and the worker", () => 
       expect(await submitEvent(p.id)).toMatchObject({ status: "published", attempts: 2 });
       await remote.processDue();
 
-      const final = (await (await fetch(`${apiUrl}/payouts/${p.id}`)).json()) as Payout;
+      const final = (await (await fetch(`${apiUrl}/payouts/${p.id}`, { headers: AS_OPERATOR })).json()) as Payout;
       expect(final.status).toBe("succeeded");
       expect(remote.payouts()).toHaveLength(1);
       expect(remote.deliveryLog.map((d) => d.ok)).toEqual([true, true]);

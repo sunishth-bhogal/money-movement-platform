@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { checkLedgerInvariants } from "../src/ledger/accounts.js";
-import { app, balanceOf, pool, postTransfer, usd, userWithBalance } from "./helpers.js";
+import { app, AS_OPERATOR, balanceOf, pool, postTransfer, usd, userWithBalance } from "./helpers.js";
 
 afterEach(async () => {
   // After every scenario, the books must balance.
@@ -45,7 +45,7 @@ describe("POST /transfers: happy path", () => {
     const bob = await userWithBalance(0);
     const t = (await postTransfer(randomUUID(), usd(alice, bob, 1000))).json();
 
-    const history = (await app.inject({ url: `/accounts/${bob}/entries` })).json().data;
+    const history = (await app.inject({ url: `/accounts/${bob}/entries`, headers: AS_OPERATOR })).json().data;
     expect(history).toHaveLength(1);
     expect(history[0]).toMatchObject({ transfer_id: t.id, amount_cents: 1000 });
   });

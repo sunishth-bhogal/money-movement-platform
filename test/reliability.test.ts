@@ -21,7 +21,7 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import { checkLedgerInvariants } from "../src/ledger/accounts.js";
 import { OutboxWorker, type Publisher } from "../src/outbox/worker.js";
-import { app, balanceOf, pool, usd, userWithBalance } from "./helpers.js";
+import { app, AS_OPERATOR, balanceOf, operatorAuth, pool, usd, userWithBalance } from "./helpers.js";
 
 afterEach(async () => {
   expect(await checkLedgerInvariants(pool)).toEqual([]);
@@ -49,7 +49,7 @@ async function outboxEventsFor(transferId: string) {
 function send(baseUrl: string, key: string, body: object) {
   return fetch(`${baseUrl}/transfers`, {
     method: "POST",
-    headers: { "content-type": "application/json", "idempotency-key": key },
+    headers: { ...AS_OPERATOR, "content-type": "application/json", "idempotency-key": key },
     body: JSON.stringify(body),
   });
 }
@@ -57,7 +57,7 @@ function send(baseUrl: string, key: string, body: object) {
 describe("the database commits but the API response is lost", () => {
   it("the connection drops after commit: the retry returns the original transfer, and money moves once", async () => {
     let dropNextResponse = true;
-    const server = buildApp(pool);
+    const server = buildApp(pool, operatorAuth);
     // Runs after the handler (so after COMMIT), just before bytes go out.
     server.addHook("onSend", async (req, _reply, payload) => {
       if (req.url === "/transfers" && dropNextResponse) {
@@ -116,18 +116,18 @@ describe("the database commits but the API response is lost", () => {
       query: pool.query.bind(pool),
     } as unknown as pg.Pool;
 
-    const lossy = buildApp(lossyPool);
+    const lossy = buildApp(lossyPool, operatorAuth);
     const alice = await userWithBalance(5000);
     const bob = await userWithBalance(0);
     const key = randomUUID();
     const body = usd(alice, bob, 700);
 
-    const first = await lossy.inject({ method: "POST", url: "/transfers", headers: { "idempotency-key": key }, payload: body });
+    const first = await lossy.inject({ method: "POST", url: "/transfers", headers: { ...AS_OPERATOR, "idempotency-key": key }, payload: body });
     expect(first.statusCode).toBe(500); // the server honestly does not know the outcome
     expect(await balanceOf(alice)).toBe(4300); // it did commit
 
     // The retry lands on a healthy instance (here: the normal app).
-    const retry = await app.inject({ method: "POST", url: "/transfers", headers: { "idempotency-key": key }, payload: body });
+    const retry = await app.inject({ method: "POST", url: "/transfers", headers: { ...AS_OPERATOR, "idempotency-key": key }, payload: body });
     expect(retry.statusCode).toBe(201);
     expect(retry.headers["idempotent-replayed"]).toBe("true");
     expect(await transfersWithKey(key)).toHaveLength(1);
@@ -140,7 +140,7 @@ describe("the database commits but the API response is lost", () => {
     const alice = await userWithBalance(5000);
     const bob = await userWithBalance(0);
     const key = randomUUID();
-    const res = await app.inject({ method: "POST", url: "/transfers", headers: { "idempotency-key": key }, payload: usd(alice, bob, 300) });
+    const res = await app.inject({ method: "POST", url: "/transfers", headers: { ...AS_OPERATOR, "idempotency-key": key }, payload: usd(alice, bob, 300) });
     // Pretend this response was lost and the client went away for good.
     const transferId = res.json().id;
 

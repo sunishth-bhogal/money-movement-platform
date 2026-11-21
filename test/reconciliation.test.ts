@@ -205,7 +205,7 @@ async function requestPayout(account: string, currency: string, cents: number, a
   const res = await app.inject({
     method: "POST",
     url: "/payouts",
-    headers: { "idempotency-key": randomUUID() },
+    headers: { ...AUTH, "idempotency-key": randomUUID() },
     payload: { account_id: account, amount_cents: cents, currency, bank_account_number: accountNumber },
   });
   expect(res.statusCode).toBe(201);
@@ -249,7 +249,7 @@ async function deposit(account: string, currency: string, cents: number) {
   const res = await app.inject({
     method: "POST",
     url: "/deposits",
-    headers: { "idempotency-key": randomUUID() },
+    headers: { ...AUTH, "idempotency-key": randomUUID() },
     payload: { account_id: account, amount_cents: cents, currency },
   });
   expect(res.statusCode).toBe(201);
