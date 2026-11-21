@@ -154,7 +154,7 @@ export async function createDeposit(
 }
 
 /** Find, or create on first use, the system account that mirrors money held at Stripe. */
-async function stripeClearingAccount(client: pg.PoolClient, currency: string): Promise<string> {
+export async function stripeClearingAccount(client: pg.PoolClient, currency: string): Promise<string> {
   await client.query(
     `INSERT INTO accounts (name, currency, kind, system_code)
      VALUES ($1, $2, 'system', 'stripe_clearing')
@@ -174,7 +174,7 @@ export type WebhookOutcome =
   | "already_final" // the deposit had already reached a final state
   | `deposit_${DepositStatus}`; // the deposit moved to this status
 
-type CheckoutSessionEvent =
+export type CheckoutSessionEvent =
   | "checkout.session.completed"
   | "checkout.session.async_payment_succeeded"
   | "checkout.session.async_payment_failed"
@@ -188,7 +188,7 @@ const CHECKOUT_EVENTS: ReadonlySet<string> = new Set<CheckoutSessionEvent>([
 ]);
 
 /** The fields of a Checkout Session that we rely on. */
-interface SessionFields {
+export interface SessionFields {
   id: string;
   client_reference_id: string | null;
   metadata: Record<string, string> | null;
@@ -231,7 +231,14 @@ export async function handleStripeEvent(pool: pg.Pool, event: Stripe.Event): Pro
   });
 }
 
-async function applyCheckoutSessionEvent(
+/**
+ * Move a deposit towards what Stripe says about its Checkout Session. Used by
+ * the webhook, and by reconciliation when Stripe's records show a payment
+ * whose webhook never reached us. One code path, so a payment found either way
+ * is credited by the same rules, and at most once (the deposit row lock, the
+ * final-state check and the `deposit:<id>` transfer key).
+ */
+export async function applyCheckoutSessionEvent(
   client: pg.PoolClient,
   type: CheckoutSessionEvent,
   session: SessionFields,

@@ -1,4 +1,4 @@
-// The bank, as our code sees it: two calls, and the errors that tell us how to
+// The bank, as our code sees it: three calls, and the errors that tell us how to
 // react. The mock bank implements this in-process (tests), and httpBankClient
 // implements it over HTTP against the mock bank server (npm run mock-bank).
 
@@ -63,6 +63,33 @@ export interface BankClient {
   createPayout(req: BankPayoutRequest, signal?: AbortSignal): Promise<BankPayout>;
   /** The bank's current record for a key, or null if it has never seen it. */
   getPayoutByKey(idempotencyKey: string, signal?: AbortSignal): Promise<BankPayout | null>;
+  /**
+   * The bank's statement: every payout it holds, oldest first, one page at a
+   * time. Reconciliation reads this to compare the bank's books with ours.
+   */
+  listPayouts(page: BankListPage, signal?: AbortSignal): Promise<{ data: BankPayout[]; has_more: boolean }>;
+}
+
+export interface BankListPage {
+  limit?: number;
+  /** A bank payout id from the previous page. */
+  starting_after?: string;
+}
+
+/**
+ * Read the whole statement, page by page. If any page fails, this throws and
+ * returns nothing: a partial statement would make every payout on the missing
+ * pages look "missing at the bank", so we never reconcile against one.
+ */
+export async function listAllBankPayouts(bank: BankClient, signal?: AbortSignal, limit = 100): Promise<BankPayout[]> {
+  const all: BankPayout[] = [];
+  let starting_after: string | undefined;
+  for (;;) {
+    const page = await bank.listPayouts({ limit, starting_after }, signal);
+    all.push(...page.data);
+    if (!page.has_more || page.data.length === 0) return all;
+    starting_after = page.data[page.data.length - 1].id;
+  }
 }
 
 /** Talks to the mock bank server over HTTP. */
@@ -101,6 +128,15 @@ export function httpBankClient(baseUrl: string, fetchImpl: typeof fetch = fetch)
       const res = await call(`/payouts?idempotency_key=${encodeURIComponent(key)}`, { signal });
       if (res.status === 404) return null;
       if (res.ok) return (await res.json()) as BankPayout;
+      throw new BankUnavailableError(`bank answered HTTP ${res.status}`);
+    },
+
+    async listPayouts(page, signal) {
+      const q = new URLSearchParams();
+      if (page.limit) q.set("limit", String(page.limit));
+      if (page.starting_after) q.set("starting_after", page.starting_after);
+      const res = await call(`/payouts?${q}`, { signal });
+      if (res.ok) return (await res.json()) as { data: BankPayout[]; has_more: boolean };
       throw new BankUnavailableError(`bank answered HTTP ${res.status}`);
     },
   };

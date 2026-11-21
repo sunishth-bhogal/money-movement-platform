@@ -70,7 +70,7 @@ export async function getPayout(db: pg.Pool | pg.PoolClient, id: string): Promis
 }
 
 /** Find, or create on first use, a system account by its code. */
-async function systemAccount(client: pg.PoolClient, code: string, name: string, currency: string): Promise<string> {
+export async function systemAccount(client: pg.PoolClient, code: string, name: string, currency: string): Promise<string> {
   await client.query(
     `INSERT INTO accounts (name, currency, kind, system_code)
      VALUES ($1, $2, 'system', $3)
@@ -206,8 +206,8 @@ export type ProviderUpdateOutcome =
   | "discrepancy" // the bank contradicts what we recorded; flagged, no money moved
   | "unknown_payout";
 
-/** Where the bank's word came from. Logged in discrepancies; the logic is the same for all three. */
-export type ProviderSource = "submit_response" | "webhook" | "status_lookup";
+/** Where the bank's word came from. Logged in discrepancies; the logic is the same for all of them. */
+export type ProviderSource = "submit_response" | "webhook" | "status_lookup" | "reconciliation";
 
 const OPEN: ReadonlySet<PayoutStatus> = new Set(["pending", "submitted"]);
 
@@ -360,7 +360,10 @@ export async function handleBankWebhook(
 /**
  * Invariants that tie payouts to the ledger. Empty means they hold.
  *  - "Payouts in flight" holds exactly the open payouts' money.
- *  - Every succeeded/returned payout is in "Bank payouts" unless returned.
+ *  - "Bank payouts" holds exactly the succeeded payouts' money.
+ * Both plus whatever reconciliation resolutions have posted to them: a person
+ * correcting the books is the one other thing allowed to move this money, and
+ * every such transfer is linked to the resolution that made it.
  */
 export async function checkPayoutInvariants(pool: pg.Pool): Promise<string[]> {
   const problems: string[] = [];
@@ -370,7 +373,10 @@ export async function checkPayoutInvariants(pool: pg.Pool): Promise<string[]> {
                        WHERE p.currency = a.currency
                          AND CASE a.system_code
                                WHEN 'payouts_in_flight' THEN p.status IN ('pending', 'submitted')
-                               ELSE p.status = 'succeeded' END), 0)::bigint AS expected
+                               ELSE p.status = 'succeeded' END), 0)::bigint
+          + COALESCE((SELECT SUM(e.amount_cents) FROM ledger_entries e
+                        JOIN reconciliation_resolution_postings rp ON rp.transfer_id = e.transfer_id
+                       WHERE e.account_id = a.id), 0)::bigint AS expected
        FROM accounts a
       WHERE a.system_code IN ('payouts_in_flight', 'bank_payouts')`,
   );

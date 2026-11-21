@@ -7,12 +7,13 @@ So far: accounts, an immutable double-entry ledger, an internal `POST /transfers
 endpoint that is idempotent and safe under concurrency, deposits through
 **Stripe Checkout in test mode**, credited only by a verified webhook, and a
 **transactional outbox** with a worker that publishes every money movement with
-retries and backoff, and **payouts to a mock bank** that is slow, fails, sends
-duplicate webhooks, loses responses and has outages on purpose. Reconciliation
-comes next (see [Roadmap](#roadmap)). All money and accounts are fictional, and Stripe is only
-ever used in test mode.
+retries and backoff, **payouts to a mock bank** that is slow, fails, sends
+duplicate webhooks, loses responses and has outages on purpose, and
+**reconciliation** of the ledger against both providers' own records, with a
+small React admin dashboard for what only a person can decide. All money and
+accounts are fictional, and Stripe is only ever used in test mode.
 
-**Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Stripe (test mode), Vitest, Docker.
+**Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Stripe (test mode), React + Vite (admin dashboard), Vitest, Docker.
 
 ## Quick start
 
@@ -29,13 +30,15 @@ npm run dev         # API on http://localhost:3000
 npm run worker      # outbox worker: prints events (or POSTs them to OUTBOX_WEBHOOK_URL),
                     # and sends payouts to the bank when BANK_API_URL is set
 npm run mock-bank   # the fake bank on :4000 (needs BANK_WEBHOOK_SECRET, see .env.example)
+npm run dashboard   # the admin dashboard on :5173 (needs ADMIN_TOKEN on the API)
 
 # tests run against a real Postgres (money_test), not mocks
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/money_test npm test
 ```
 
 Or run the API, the worker, the mock bank and the database together with `docker compose up --build`
-(add `--scale worker=3` to run several workers side by side).
+(add `--scale worker=3` to run several workers side by side). The dashboard is then at
+<http://localhost:3000/dashboard/>; sign in with any name and the token `local-admin-token`.
 
 The tests need no Stripe account: webhook signatures are generated with Stripe's
 SDK against a throwaway secret, and the Checkout API is faked.
@@ -96,6 +99,41 @@ returned, anything else succeeds. `{"outage":true}` takes the bank down, and
 `{"webhooksEnabled":false}` makes it stop telling us anything, which leaves the
 reconciler to find out.
 
+### Demo: reconciliation finds what nobody told us, and a person settles the rest
+
+With everything running (`docker compose up --build`), make the bank lose its
+next response and stop sending webhooks, so nobody tells us how the payout ends:
+
+```bash
+curl -s -X POST localhost:4000/_admin/behaviour -H 'content-type: application/json' \
+  -d '{"loseResponses":1,"webhooksEnabled":false}'
+curl -s -X POST localhost:3000/payouts -H 'content-type: application/json' \
+  -H 'Idempotency-Key: recon-demo-1' \
+  -d '{"account_id":"<alice>","amount_cents":700,"currency":"USD","bank_account_number":"000123451111"}'
+```
+
+A few seconds later the bank has paid it out, and `GET /payouts/<id>` still
+says `submitted`. Open the dashboard and press **Run reconciliation**: the run
+reads the bank's statement, finds the payout paid, settles it (one `settle`
+transfer, through the same code a webhook uses), and lists it as
+auto-resolved. The proof column says the run *ties out*. (The test suite also
+covers the harder version, where an outage outlasts every retry and the payout
+is still `pending` with its submit event dead.)
+
+Now make the bank change its story about a payout that already succeeded:
+
+```bash
+curl -s -X POST localhost:4000/_admin/tamper -H 'content-type: application/json' \
+  -d '{"idempotency_key":"payout:<payout id>","status":"failed"}'
+```
+
+Run again. This one is an open break ("The bank says failed, we recorded
+succeeded"), because code never reverses a final payout on its own. Click the
+payout key to see every transfer behind it, then resolve it ("Provider is
+right: settle with the user's account", with a note). The refund is a new
+ledger transfer, linked to your decision in the audit log, and the next run is
+clean. The same API is under `/admin` (see below).
+
 ### Demo: the same transfer sent twice moves money once
 
 ```bash
@@ -125,6 +163,21 @@ went from 5000 to 4000 exactly once.
 | `POST` | `/webhooks/bank` | Mock bank events. Requires a valid `Bank-Signature` (HMAC-SHA256). Same status codes as the Stripe webhook. |
 | `POST` | `/webhooks/stripe` | Stripe events. Requires a valid `Stripe-Signature`. `400` if verification fails, `200` once processed (or a duplicate), `500` on an error so Stripe retries. |
 
+The admin API needs `Authorization: Bearer <ADMIN_TOKEN>` (`401` without it, `503` if `ADMIN_TOKEN` is unset):
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/admin/summary` | Counts for the dashboard, control account balances, latest run per source and currency. |
+| `POST` | `/admin/reconciliation/runs` | `{ source: "mock_bank" \| "stripe", currency }`. Runs now. `201` with the run, `502` with a `failed` run if the provider's statement could not be read, `409 run_in_progress`. |
+| `GET` | `/admin/reconciliation/runs`, `/admin/reconciliation/runs/:id` | Runs, and one run with its items. |
+| `GET` | `/admin/reconciliation/breaks` | Open and in-transit items from the latest runs. `?include_resolved=true` adds resolved ones. |
+| `POST` | `/admin/reconciliation/items/:id/resolve` | `{ action: "accept_provider" \| "accept_ours", counterparty?: "user" \| "platform", note, resolved_by }`. `201`; the same request again replays it. `409` for `stale_item`, `ledger_changed`, `already_resolved`; `422 insufficient_funds`. |
+| `GET` | `/admin/reconciliation/trace?break_key=payout:<id>` | Every ledger transfer, run and decision behind one item. |
+| `GET` | `/admin/resolutions` | The audit log. |
+| `GET` | `/admin/payouts/flagged` | Payouts the bank contradicted, and payouts held for over an hour. |
+| `POST` | `/admin/payouts/:id/acknowledge` | `{ note, resolved_by }`. Records that a person looked at a flag. Moves no money. |
+| `GET` / `POST` | `/admin/outbox/dead`, `/admin/outbox/:event_id/requeue` | Dead events, and putting one back in the queue. |
+
 `POST /transfers` responses:
 
 | Status | Meaning |
@@ -152,6 +205,12 @@ outbox            id, event_id UNIQUE, event_type, aggregate_type/id, payload,
                   status (pending|published|dead), attempts, next_attempt_at, claim_token
 payouts           id, idempotency_key UNIQUE, account_id, amount_cents, bank_account_number, status,
                   provider_payout_id UNIQUE, hold/settle/reverse/return_transfer_id, discrepancy
+reconciliation_runs                 id, source, currency, status, counts, totals (the proof)    -- final once finished
+reconciliation_items                run_id, break_key, classification, outcome, positions,
+                                    auto_action, auto_transfer_ids, fingerprint               -- append-only
+reconciliation_resolutions          item_id UNIQUE | payout_id, action, counterparty, note,
+                                    resolved_by, fingerprint                                  -- append-only
+reconciliation_resolution_postings  resolution_id, transfer_id UNIQUE                         -- append-only
 ```
 
 See [`migrations/`](migrations/).
@@ -399,8 +458,8 @@ with a fresh budget once someone has fixed the cause.
   they don't slow the worker down meanwhile.
 - **Outgoing HTTP events are not signed yet.** A receiver can't yet verify they
   came from us. That would be an HMAC header, like Stripe's.
-- **Dead events need a person.** There is no admin endpoint or alert for them
-  yet. That belongs with the reconciliation dashboard.
+- **Dead events need a person.** The admin dashboard lists them and can
+  re-queue one. There is no alert yet.
 
 ### Payouts: the mock bank connector
 
@@ -473,7 +532,7 @@ arrived, a retry budget that ran out during an outage. The design has three part
    saying succeeded, or reports a different amount or payout id, is recorded in
    `discrepancy` and emits a `payout.discrepancy` event, and **no money moves**.
    Code can't safely claw back a reversal the user may already have spent, so a
-   person decides (stage 5's dashboard lists these).
+   person decides, from the reconciliation dashboard.
 
 2. **Ask the bank, by idempotency key.** The [reconciler](src/payouts/reconcile.ts),
    run by the worker every 30s, looks up open payouts that have been quiet for a
@@ -526,11 +585,134 @@ webhooks our endpoint didn't accept.
   it is sent. That would give "the bank never got it" a third option besides
   waiting and resending.
 - **Payouts don't expire.** One that the bank never receives and that someone
-  never re-queues stays `pending` with its money held. That is safe, but
-  stage 5's dashboard should show old pending payouts.
-- **Discrepancies need a person.** There is no admin action to resolve one yet.
+  never re-queues stays `pending` with its money held. That is safe, and the
+  dashboard lists payouts held for over an hour.
+- **Discrepancies need a person.** Since stage 5, the dashboard shows them, and
+  reconciliation turns any that leave money in the wrong place into breaks
+  with a resolution (see below).
 - **The mock bank's state is in memory.** Restarting it forgets every payout,
   which the reconciler will (correctly) report as discrepancies.
+
+### Reconciliation: how do we prove where every dollar went?
+
+Code: [`src/reconciliation/`](src/reconciliation/), the admin API in
+[`src/admin/routes.ts`](src/admin/routes.ts), the dashboard in
+[`dashboard/`](dashboard/).
+
+Webhooks, responses and status lookups tell us what happened one message at a
+time, and stage 4 showed every way those messages get lost. Reconciliation
+stops trusting the messages and compares **books with books**: the providers'
+own records (the mock bank's statement, `GET /payouts`, paginated; Stripe's
+Checkout Sessions, `checkout.sessions.list`) against our ledger.
+
+**The ledger side is the ledger, not our status columns.** Each source has
+control accounts: `Payouts in flight` and `Bank payouts` for the bank,
+`Stripe clearing` for Stripe. Every transfer that touches them belongs to an
+item: by its key (`payout:<id>:hold`, `payout:<id>:settle`, `deposit:<id>`, ...)
+or because a person's resolution posted it. So for each payout or deposit the
+run knows, from the entries themselves, how much the ledger says is *in
+flight* and how much has *left* (or, for Stripe, been *collected*). The provider's
+record says the same two things (`processing` → in flight; `succeeded` → left;
+`failed`/`returned` → neither; a paid session → collected). Equal: matched.
+Different: a break.
+
+| Break | Means |
+|---|---|
+| `missing_at_provider` | We have money against it; the provider has no record. |
+| `missing_in_ledger` | The provider has a record; we have nothing for it. |
+| `amount_mismatch` | Both have it, for different amounts. |
+| `status_mismatch` | Same amount, but the money is somewhere else (e.g. "in flight" for us, "paid out" at the bank). |
+
+Comparing money rather than labels matters: a payout that we recorded as
+`returned` and the bank calls `failed` has no money out of place, so it isn't a
+break (it stays a flag on the payout, which a person can acknowledge). A
+payout we call `succeeded` that the bank calls `failed` has 20.00 sitting in
+`Bank payouts` that never left, and it is.
+
+**The proof.** Every run stores, per dimension (in flight, settled), the
+ledger's control account total, the provider's total, the sum of what the
+remaining items disagree by, and anything on the control accounts that belongs
+to no item. A run *ties out* when
+
+```
+ledger total − provider total = Σ (ledger − provider) over the remaining items,   and   unexplained = 0
+```
+
+So every cent of difference between our books and the provider's has a named
+item with a classification, and there is no money on a control account that we
+cannot attribute to a payout, a deposit or a person's decision. The tests
+assert this after every scenario, and the dashboard shows it per run.
+
+**What a run fixes by itself, and nothing else.** An item still open on our
+side (a `pending`/`submitted` payout, a deposit not yet credited) where the
+provider's record says how it ended: the run applies it through the same
+function a webhook uses (`applyProviderState`, `applyCheckoutSessionEvent`), so
+it can only move money forward, and only once. That resolves the uncertain
+states from stage 4 without a person:
+
+| Uncertain state | What the run sees | What it does |
+|---|---|---|
+| Response lost, outage outlasted every retry, no webhook | ours `pending`, bank `succeeded` | settles it (one `settle` transfer) |
+| Same, bank still processing | ours `pending` (held), bank `processing` (in flight) | nothing: same money, same place, matched |
+| Bank never got it, submit event dead | ours `pending`, no bank record | in transit, not a break; re-queues the submit (same key) |
+| Stripe charged the card, webhook lost | deposit `pending`, session `paid` | credits it once; a late webhook is `already_final` |
+| Stripe collected a different amount | deposit `requires_review`, session `paid` 24.00 | nothing: an open break for a person |
+
+A provider contradicting a *final* state of ours is never fixed by code. It is
+an open break.
+
+Runs start from the dashboard, the API, or the worker, which runs one per
+configured provider every `RECONCILE_EVERY_MS` (5 minutes by default, for the
+currencies in `RECONCILE_CURRENCIES`).
+
+**A partial statement is never used.** The statement is read page by page, and
+if any page fails the run is stored as `failed` and nothing is compared or
+changed. Otherwise every payout on the missing pages would look "missing at
+the bank". One run per source and currency at a time (an advisory lock); a
+second gets `409`.
+
+**What a person decides, and how it is recorded.** From the dashboard (or
+`POST /admin/reconciliation/items/:id/resolve`):
+
+- **Provider is right** (`accept_provider`). The run computes the transfers
+  that move the ledger to the provider's position: first between our own
+  control accounts (in flight → paid out), then the rest to or from a
+  counterparty the person picks: the **user** (their money never left, so it
+  goes back; or it did, so it is taken back, refused with `insufficient_funds`
+  if they have spent it), or the **platform**, through a `Reconciliation
+  adjustments` account that records the business's loss or gain.
+- **Our ledger is right** (`accept_ours`): no money moves. Later runs show the
+  same disagreement as `acknowledged`, still counted in the proof. If anything
+  about it changes (the fingerprint covers statuses, amounts and positions), it
+  comes back as open.
+
+Every resolution is a row in an append-only table with the person's name and
+note, and every transfer it posts is a normal, balanced, system-scoped ledger
+transfer keyed `recon:<resolution id>:<n>`, linked to it. The original
+postings are never touched: a refund after a wrong settle is a new transfer
+next to the settle, and the trace view shows both. Runs are final once
+finished, and items, resolutions and their links reject `UPDATE` and `DELETE`
+in the database, like `ledger_entries`.
+
+**Resolving safely.** A resolution is one transaction that takes the item's
+lock (shared with the run's own fixes) and the payout or deposit row lock
+(shared with webhooks), then re-reads the ledger. If the money moved since the
+run looked (a webhook arrived), it is refused with `ledger_changed`: run again
+and decide on what is true now. Only items from the latest run can be
+resolved (`stale_item` otherwise), and one resolution per item is a unique
+constraint, so ten clicks on "Resolve" post one correction.
+
+**Known limits, deliberately deferred:**
+
+- **Runs compare all history** for a source and currency. At volume they would
+  cover a statement period (a day), with a margin for records that straddle it.
+- **One shared admin token.** `resolved_by` is what the operator typed. Real
+  operator identity (SSO, roles, a second approver for large corrections)
+  comes with auth.
+- **Statements are fetched whole, in memory.** Fine for a mock bank and a test
+  Stripe account; a real one would stream into a staging table.
+- **The mock bank's records are in memory.** Restarting it makes every payout
+  "missing at the provider", which is what reconciliation should say.
 
 ### Webhook deduplication
 
@@ -607,8 +789,8 @@ Events for unknown deposits, for a session we didn't create, or of types we
 don't handle are recorded and acknowledged (`outcome: "ignored"`).
 
 **The clearing account.** `Stripe clearing (USD)` is a `system` account created
-on first use. It goes negative by the amount Stripe holds for us, which is what
-reconciliation (stage 5) will compare against Stripe's balance.
+on first use. It goes negative by the amount Stripe has collected for us, which
+reconciliation compares, session by session, with Stripe's own records.
 
 **Known limits, deliberately deferred:**
 
@@ -620,8 +802,10 @@ reconciliation (stage 5) will compare against Stripe's balance.
   outbox. Splitting "record and acknowledge" from "apply" only pays off once
   applying gets slow, which it isn't yet.
 - If webhooks stop arriving altogether (endpoint misconfigured, outage), deposits
-  stay `pending`. A sweeper that asks Stripe about old `pending` sessions belongs
-  with reconciliation.
+  stay `pending` until the next reconciliation run, which finds the paid
+  session in Stripe's records and credits it through the webhook's own code.
+  Sessions that expired without payment are left `pending` (no money is at
+  stake); syncing that label is a small follow-up.
 
 ## Tests
 
@@ -666,8 +850,20 @@ The tests run against real PostgreSQL. Concurrency bugs don't show up against mo
 | Webhooks out of order? | `the webhook beats our own response ...`, `out of order: 'returned' arrives before 'succeeded' ...` |
 | Bank contradicts itself or us? | `the bank contradicts itself ...`, `the bank reports a different amount ...`, `the bank acknowledged a payout and then lost it ...` |
 | All of it at once? | `chaos: 30 payouts through lost responses, an outage, duplicate webhooks and no webhooks ...` |
+| **Where did every dollar go?** | `payouts across every outcome and paid deposits all match, and the totals tie out to the cent` |
+| **Response cut off, retries exhausted, no webhook?** | `the bank's response is cut off, retries run out, no webhook ever comes: the statement settles it, exactly once` |
+| Stripe charged, webhook lost? | `Stripe charged the card but the webhook was lost: the run credits the deposit once, and the late webhook changes nothing` |
+| The statement itself is cut off? | `the provider's statement is itself cut off mid-way: the run fails, changes nothing, and the next one completes` (bank and Stripe) |
+| Bank never got it: do we fail it on a guess? | `a pending payout the bank never received is in transit, not failed ...` |
+| Bank contradicts a final state? | `the bank says failed after we settled it: an open break; accepting the bank refunds the user with a linked posting` |
+| The user spent a wrong refund? | `we refunded a payout the bank actually paid: the user is debited if they can cover it, otherwise the platform absorbs it` |
+| Bank lost a payout / has one we never sent? | `the bank lost a payout it acknowledged ...`, `a payout at the bank we never sent: only the platform can absorb it` |
+| Same disagreement on every run? | `accept_ours moves no money; the same disagreement stays settled on later runs, and any change brings it back` |
+| Double-clicked "Resolve"? | `10 simultaneous clicks on 'accept' post one correction ...` |
+| A webhook fixes it while a person decides? | `if the money moved since the run looked, the correction is refused rather than applied twice` |
+| Can the evidence be rewritten? | `runs, items and resolutions are evidence: they cannot be edited or deleted` |
 
-CI (GitHub Actions) runs the typecheck and the full suite against a Postgres 16 service container.
+CI (GitHub Actions) runs the typecheck (API and dashboard), builds the dashboard, and runs the full suite against a Postgres 16 service container.
 
 ## Roadmap
 
@@ -675,5 +871,5 @@ CI (GitHub Actions) runs the typecheck and the full suite against a Postgres 16 
 2. ✅ **Payments:** Stripe test Checkout, a verified webhook, and a deposit posted from the webhook (not from the success page).
 3. ✅ **Reliability:** a transactional outbox, a concurrent-safe worker with retries and backoff, and idempotency-key scopes.
 4. ✅ **Bank connector:** payouts to a mock bank with delayed success, failures, returns, lost responses, duplicate webhooks and outages, and a reconciler that recovers when the bank and we disagree.
-5. **Reconciliation:** compare the ledger against provider records, with an admin dashboard for unmatched items.
+5. ✅ **Reconciliation:** compare the ledger against the bank's and Stripe's records, prove the totals tie out, fix what the provider's record settles, and an admin dashboard where a person resolves the rest as auditable ledger postings.
 6. **Dashboard:** a small React UI for balances and history.

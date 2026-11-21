@@ -1,19 +1,22 @@
 {
   "name": "money-movement-platform",
   "version": "1.0.0",
-  "description": "Money movement platform: idempotent, concurrency-safe transfers on an immutable double-entry ledger, Stripe test deposits and mock-bank payouts",
+  "description": "Money movement platform: idempotent, concurrency-safe transfers on an immutable double-entry ledger, Stripe test deposits, mock-bank payouts, and reconciliation against provider records",
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
     "worker": "tsx src/outbox/run.ts",
     "migrate": "tsx src/migrate.ts",
     "seed": "tsx scripts/seed.ts",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p dashboard",
     "test": "vitest run",
-    "mock-bank": "tsx src/bank/run.ts"
+    "mock-bank": "tsx src/bank/run.ts",
+    "dashboard": "vite --config dashboard/vite.config.ts",
+    "dashboard:build": "vite build --config dashboard/vite.config.ts"
   },
   "license": "MIT",
   "dependencies": {
+    "@fastify/static": "^10.1.12",
     "fastify": "^5.12.8",
     "pg": "^8.23.1",
     "stripe": "23.1.0",
@@ -22,8 +25,14 @@
   "devDependencies": {
     "@types/node": "^26.6.6",
     "@types/pg": "^8.23.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
+    "vite": "^8.3.8",
     "vitest": "^5.1.1"
   },
   "type": "module",
