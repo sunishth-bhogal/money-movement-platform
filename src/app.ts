@@ -6,6 +6,9 @@ import { createAccount, getAccount, listEntries } from "./ledger/accounts.js";
 import { createTransfer, getTransfer, type Transfer } from "./ledger/transfers.js";
 import { createDeposit, getDeposit, handleStripeEvent, type Deposit } from "./payments/deposits.js";
 import { verifyStripeEvent, type PaymentsConfig } from "./payments/stripe.js";
+import type { BankWebhookEvent } from "./bank/mockBank.js";
+import { BANK_SIGNATURE_HEADER, verifyBankWebhook } from "./bank/signature.js";
+import { createPayout, getPayout, handleBankWebhook, type Payout } from "./payouts/payouts.js";
 
 const uuid = z.string().uuid();
 const currency = z.string().regex(/^[A-Z]{3}$/, "ISO 4217 code, e.g. USD");
@@ -25,6 +28,14 @@ const depositBody = z.object({
   currency,
 });
 
+const payoutBody = z.object({
+  account_id: uuid,
+  amount_cents: z.number().int().positive().max(100_000_000_00),
+  currency,
+  // Digits only. The mock bank decides the outcome from the last four (see src/bank/mockBank.ts).
+  bank_account_number: z.string().regex(/^\d{4,17}$/, "4-17 digits"),
+});
+
 const accountBody = z.object({ name: z.string().min(1).max(200), currency });
 
 // Keys are client-generated (a UUID v4 is ideal). Bounded so they can't be used to bloat the index.
@@ -38,6 +49,10 @@ function serializeDeposit(d: Deposit) {
   return { ...d, created_at: d.created_at.toISOString(), updated_at: d.updated_at.toISOString() };
 }
 
+function serializePayout(p: Payout) {
+  return { ...p, created_at: p.created_at.toISOString(), updated_at: p.updated_at.toISOString() };
+}
+
 function requireIdempotencyKey(header: unknown): string {
   const parsed = idempotencyKey.safeParse(header);
   if (!parsed.success) {
@@ -48,7 +63,12 @@ function requireIdempotencyKey(header: unknown): string {
 
 export function buildApp(
   pool: pg.Pool,
-  opts: { logger?: boolean; payments?: PaymentsConfig } = {},
+  opts: {
+    logger?: boolean;
+    payments?: PaymentsConfig;
+    /** Shared secret for bank webhook signatures. Unset: POST /webhooks/bank returns 503. */
+    bankWebhookSecret?: string;
+  } = {},
 ): FastifyInstance {
   const payments: PaymentsConfig = opts.payments ?? { appBaseUrl: "http://localhost:3000" };
   const app = Fastify({ logger: opts.logger ?? false });
@@ -141,6 +161,31 @@ export function buildApp(
     return serializeDeposit(deposit);
   });
 
+  // ---- Payouts (mock bank) ----------------------------------------------------
+
+  // Holds the money and queues the payout for the bank, in one transaction.
+  // No bank call happens here: the outbox worker sends it after commit.
+  app.post("/payouts", async (req, reply) => {
+    const key = requireIdempotencyKey(req.headers["idempotency-key"]);
+    const body = payoutBody.parse(req.body);
+    const { payout, replayed } = await createPayout(pool, key, body);
+    if (replayed) reply.header("Idempotent-Replayed", "true");
+    if (payout.status === "rejected") {
+      return reply.status(422).send({
+        error: { code: payout.failure_reason, message: "Payout rejected." },
+        payout: serializePayout(payout),
+      });
+    }
+    return reply.status(201).send(serializePayout(payout));
+  });
+
+  app.get("/payouts/:id", async (req) => {
+    const id = uuid.parse((req.params as { id: string }).id);
+    const payout = await getPayout(pool, id);
+    if (!payout) throw new ApiError(404, "payout_not_found", "Payout not found.");
+    return serializePayout(payout);
+  });
+
   // Signature verification needs the exact bytes Stripe signed, so this route
   // lives in its own scope where JSON bodies are kept as a raw Buffer.
   app.register(async (scope) => {
@@ -167,6 +212,31 @@ export function buildApp(
       // A thrown error becomes a 500, so Stripe retries. Because processing is
       // one transaction, a failed attempt leaves nothing behind.
       const result = await handleStripeEvent(pool, event);
+      return reply.status(200).send({ received: true, ...result });
+    });
+
+    // Same contract as the Stripe webhook: 400 if the signature is bad
+    // (nothing recorded), 200 once processed or a duplicate, 500 on an error
+    // so the bank redelivers.
+    scope.post("/webhooks/bank", async (req, reply) => {
+      if (!opts.bankWebhookSecret) {
+        throw new ApiError(503, "payouts_not_configured", "Set BANK_WEBHOOK_SECRET to accept bank webhooks.");
+      }
+      const signature = req.headers[BANK_SIGNATURE_HEADER];
+      if (typeof signature !== "string" || !Buffer.isBuffer(req.body)) {
+        throw new ApiError(400, "invalid_signature", "Missing Bank-Signature header or JSON body.");
+      }
+      let event: BankWebhookEvent;
+      try {
+        verifyBankWebhook(req.body, signature, opts.bankWebhookSecret);
+        event = JSON.parse(req.body.toString("utf8"));
+      } catch {
+        throw new ApiError(400, "invalid_signature", "Webhook signature verification failed.");
+      }
+      if (typeof event?.id !== "string" || typeof event.type !== "string") {
+        throw new ApiError(400, "invalid_event", "Webhook body is not a bank event.");
+      }
+      const result = await handleBankWebhook(pool, event);
       return reply.status(200).send({ received: true, ...result });
     });
   });

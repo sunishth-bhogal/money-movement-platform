@@ -1,7 +1,7 @@
 {
   "name": "money-movement-platform",
   "version": "1.0.0",
-  "description": "Money movement platform: idempotent, concurrency-safe transfers on an immutable double-entry ledger",
+  "description": "Money movement platform: idempotent, concurrency-safe transfers on an immutable double-entry ledger, Stripe test deposits and mock-bank payouts",
   "scripts": {
     "dev": "tsx watch src/server.ts",
     "start": "tsx src/server.ts",
@@ -9,7 +9,8 @@
     "migrate": "tsx src/migrate.ts",
     "seed": "tsx scripts/seed.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "mock-bank": "tsx src/bank/run.ts"
   },
   "license": "MIT",
   "dependencies": {

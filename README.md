@@ -7,8 +7,9 @@ So far: accounts, an immutable double-entry ledger, an internal `POST /transfers
 endpoint that is idempotent and safe under concurrency, deposits through
 **Stripe Checkout in test mode**, credited only by a verified webhook, and a
 **transactional outbox** with a worker that publishes every money movement with
-retries and backoff. A mock bank connector and reconciliation come next (see
-[Roadmap](#roadmap)). All money and accounts are fictional, and Stripe is only
+retries and backoff, and **payouts to a mock bank** that is slow, fails, sends
+duplicate webhooks, loses responses and has outages on purpose. Reconciliation
+comes next (see [Roadmap](#roadmap)). All money and accounts are fictional, and Stripe is only
 ever used in test mode.
 
 **Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Stripe (test mode), Vitest, Docker.
@@ -25,13 +26,15 @@ export DATABASE_URL=postgres://postgres:postgres@localhost:5432/money_dev
 
 npm run seed        # funding account + Alice ($50.00) + Bob; prints their ids
 npm run dev         # API on http://localhost:3000
-npm run worker      # outbox worker: prints events (or POSTs them to OUTBOX_WEBHOOK_URL)
+npm run worker      # outbox worker: prints events (or POSTs them to OUTBOX_WEBHOOK_URL),
+                    # and sends payouts to the bank when BANK_API_URL is set
+npm run mock-bank   # the fake bank on :4000 (needs BANK_WEBHOOK_SECRET, see .env.example)
 
 # tests run against a real Postgres (money_test), not mocks
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/money_test npm test
 ```
 
-Or run the API, the worker and the database together with `docker compose up --build`
+Or run the API, the worker, the mock bank and the database together with `docker compose up --build`
 (add `--scale worker=3` to run several workers side by side).
 
 The tests need no Stripe account: webhook signatures are generated with Stripe's
@@ -64,6 +67,35 @@ Open the returned `checkout_url` and pay with the test card `4242 4242 4242 4242
 browser never had to come back. Run `stripe events resend <evt_id>` to redeliver
 the event: the response says `"outcome":"duplicate"` and the balance does not change.
 
+### Demo: a payout survives a lost response and duplicate webhooks
+
+With the API, the worker and the mock bank running (`docker compose up --build`
+does all three), make the bank lose its next response and send every webhook twice:
+
+```bash
+curl -s -X POST localhost:4000/_admin/behaviour -H 'content-type: application/json' \
+  -d '{"loseResponses":1,"webhookCopies":2}'
+
+curl -s -X POST localhost:3000/payouts \
+  -H 'content-type: application/json' \
+  -H 'Idempotency-Key: payout-demo-1' \
+  -d '{"account_id":"<alice>","amount_cents":2000,"currency":"USD","bank_account_number":"000123451111"}'
+```
+
+The payout comes back `pending`, and Alice's balance is already down by 2000
+(the money is on hold). The worker's first call to the bank "times out", though
+the bank did create the payout. The retry sends the same idempotency key and
+gets that payout back. A few seconds later the bank settles it and sends the
+`payout.succeeded` webhook twice. `GET /payouts/<id>` says `succeeded`,
+`GET localhost:4000/_admin/state` shows one payout at the bank, and the second
+webhook was acknowledged as a duplicate.
+
+The last four digits of `bank_account_number` pick the outcome: `0002` fails
+after settlement, `0004` is refused at once, `0005` succeeds and is then
+returned, anything else succeeds. `{"outage":true}` takes the bank down, and
+`{"webhooksEnabled":false}` makes it stop telling us anything, which leaves the
+reconciler to find out.
+
 ### Demo: the same transfer sent twice moves money once
 
 ```bash
@@ -88,6 +120,9 @@ went from 5000 to 4000 exactly once.
 | `GET` | `/transfers/:id` | |
 | `POST` | `/deposits` | Requires an `Idempotency-Key` header. Body: `{ account_id, amount_cents, currency }`. Returns a `pending` deposit with a Stripe `checkout_url`. Moves no money. |
 | `GET` | `/deposits/:id` | Deposit status. Also the Checkout success/cancel page; visiting it changes nothing. |
+| `POST` | `/payouts` | Requires an `Idempotency-Key` header. Body: `{ account_id, amount_cents, currency, bank_account_number }`. Holds the money and returns a `pending` payout (`201`), or `422 insufficient_funds` with a `rejected` one. The bank is called afterwards, by the worker. |
+| `GET` | `/payouts/:id` | Payout status: `pending`, `submitted`, `succeeded`, `failed`, `returned` or `rejected`, plus any `discrepancy`. |
+| `POST` | `/webhooks/bank` | Mock bank events. Requires a valid `Bank-Signature` (HMAC-SHA256). Same status codes as the Stripe webhook. |
 | `POST` | `/webhooks/stripe` | Stripe events. Requires a valid `Stripe-Signature`. `400` if verification fails, `200` once processed (or a duplicate), `500` on an error so Stripe retries. |
 
 `POST /transfers` responses:
@@ -115,6 +150,8 @@ deposits          id, idempotency_key UNIQUE, account_id, amount_cents, status,
                   stripe_checkout_session_id UNIQUE, transfer_id UNIQUE           -- Stripe Checkout state
 outbox            id, event_id UNIQUE, event_type, aggregate_type/id, payload,
                   status (pending|published|dead), attempts, next_attempt_at, claim_token
+payouts           id, idempotency_key UNIQUE, account_id, amount_cents, bank_account_number, status,
+                  provider_payout_id UNIQUE, hold/settle/reverse/return_transfer_id, discrepancy
 ```
 
 See [`migrations/`](migrations/).
@@ -365,6 +402,136 @@ with a fresh budget once someone has fixed the cause.
 - **Dead events need a person.** There is no admin endpoint or alert for them
   yet. That belongs with the reconciliation dashboard.
 
+### Payouts: the mock bank connector
+
+Code: [`src/bank/`](src/bank/) (the fake bank and the client for it) and
+[`src/payouts/`](src/payouts/) (our side). A payout sends money *out* of the
+closed system, through a bank we can only reach over the network, which can be
+slow, wrong, silent or down.
+
+**The ledger never waits for the bank.** `POST /payouts` makes no network call.
+In one transaction it records the payout, **holds** the money with a transfer
+from the user to a `Payouts in flight` system account, and writes a
+`payout.submit` event to the outbox. The usual row lock and funds check apply,
+so ten simultaneous $10 payouts from a $50 account hold exactly five. Because
+the hold and the instruction to pay commit together, money is never held for a
+payout that nobody will send, and a payout is never sent without its money held.
+
+```
+user ──hold──► Payouts in flight ──settle──► Bank payouts          succeeded
+                       └──────────reverse──► user                  failed
+               Bank payouts ──return──► user                       returned (after success)
+```
+
+Each step is a `system`-scoped transfer with the key `payout:<id>:<step>`, so
+posting a step twice is a no-op. The schema adds the rule that matters most:
+held money either leaves for the bank or comes back to the user, never both
+(`CHECK (settle_transfer_id IS NULL OR reverse_transfer_id IS NULL)`). The test
+suite checks after every test that `Payouts in flight` holds exactly the open
+payouts' money and `Bank payouts` exactly the succeeded ones.
+
+**Sending goes through the outbox worker.** The worker routes `payout.submit`
+events to the bank connector ([`submitter.ts`](src/payouts/submitter.ts)) and
+everything else to the usual destination, so payouts get leases, retries with
+backoff, fencing and dead-lettering for free. Every attempt sends the same
+idempotency key, `payout:<id>`. The connector sorts the bank's answers into three kinds:
+
+| The bank says | It means | We do |
+|---|---|---|
+| `201`/`200` with the payout | it has it (new, or a replay of an earlier attempt) | record it: `submitted`, or straight to its final status if the bank already finished |
+| `422` (e.g. invalid account number) | definitely refused, and holds no money for it | `failed`, reverse the hold, done (not retried) |
+| timeout, connection error, `5xx`, `429` | **unknown**: it may or may not have acted | change nothing; throw, so the worker retries with the same key |
+
+**Webhooks** (`POST /webhooks/bank`) are signed like Stripe's
+(`t=<ts>,v1=<HMAC-SHA256 of "<ts>.<raw body>">`, 5 minutes' tolerance) and
+deduplicated by `processed_events` in the same transaction as their effects, so
+a duplicate delivery is acknowledged and skipped.
+
+#### How does our system recover when the provider's state differs from ours?
+
+The bank is the source of truth for whether money left. Our database is the
+source of truth for what we *told the user*. They drift apart whenever a
+message is lost: a response that never came back, a webhook that never
+arrived, a retry budget that ran out during an outage. The design has three parts:
+
+1. **One way to apply the bank's word, whichever way it arrives.** The response
+   to our submit, a webhook and a status lookup all go through
+   [`applyProviderState`](src/payouts/payouts.ts). It moves our payout *towards
+   the bank's state*, rather than reacting to "this message", so the three can
+   arrive in any order and any number of times:
+
+   | ours \ bank | processing | succeeded | failed | returned |
+   |---|---|---|---|---|
+   | pending | → submitted | → succeeded (settle) | → failed (reverse) | settle, then return |
+   | submitted | no change | → succeeded (settle) | → failed (reverse) | settle, then return |
+   | succeeded | no change | no change | **discrepancy** | → returned (return) |
+   | failed | no change | **discrepancy** | no change | **discrepancy** |
+   | returned | no change | no change | **discrepancy** | no change |
+
+   An older status (a slow lookup, a late webhook) is stale news and never moves
+   a payout backwards. A *contradiction*, where the bank says failed after
+   saying succeeded, or reports a different amount or payout id, is recorded in
+   `discrepancy` and emits a `payout.discrepancy` event, and **no money moves**.
+   Code can't safely claw back a reversal the user may already have spent, so a
+   person decides (stage 5's dashboard lists these).
+
+2. **Ask the bank, by idempotency key.** The [reconciler](src/payouts/reconcile.ts),
+   run by the worker every 30s, looks up open payouts that have been quiet for a
+   minute. The key is computed from our payout id, so the lookup works even if
+   we never learned the bank's id (the response that carried it was lost).
+   Whatever the bank says goes through the same `applyProviderState`.
+
+3. **Never infer failure from silence.** If the bank has no record of a pending
+   payout, that does **not** mean it failed: a request may still be in flight,
+   and returning the money to the user while the bank may still pay it out
+   would pay it twice. Instead: if the submit event is `dead`, the reconciler
+   puts it back in the queue (the same key makes resending safe); if a retry is
+   still scheduled, it leaves it alone. The only things that mark a payout
+   `failed` are the bank saying so, or a `422` refusal. A payout the bank
+   *acknowledged* and then has no record of is a discrepancy.
+
+What that looks like in each case (all in [`test/payouts.test.ts`](test/payouts.test.ts)):
+
+| What happened | Bank | Us, before | How it converges |
+|---|---|---|---|
+| Response lost after the bank created the payout | processing | pending | The retry sends the same key and gets the same payout back. One payout at the bank. |
+| ...then an outage outlasts every retry, and webhooks are lost too | succeeded | pending, submit event `dead` | The reconciler looks it up by key and settles it. Not sent again. |
+| Same, but the bank failed it | failed | submitted | The reconciler reverses the hold. |
+| Outage from the start: the bank never got it | (nothing) | pending, submit event `dead` | The reconciler re-queues the submit. It is sent once and settles. |
+| Outage, but a retry is still scheduled | (nothing) | pending | Left alone. Not failed on a guess. |
+| The webhook arrives before our own response | succeeded | pending | The webhook settles it; the late retry sees it's done and stops. |
+| `returned` arrives before `succeeded` | returned | submitted | Settle, then return, once each, in order. The late `succeeded` is no change. |
+| The bank contradicts itself | failed | succeeded | Discrepancy recorded, no money moves. |
+| The bank has a different amount | 2500 | 2000 | Discrepancy recorded, still held. |
+| The bank lost a payout it acknowledged | (nothing) | submitted | Discrepancy recorded, still held. |
+
+A chaos test pushes 30 payouts across all four outcomes through lost responses,
+an outage, duplicate webhooks and a stretch with no webhooks at all, and checks
+that each ends in exactly the bank's state, the bank holds 30 payouts (none
+sent twice), and every balance is right.
+
+**The mock bank** ([`src/bank/mockBank.ts`](src/bank/mockBank.ts)) keeps its own
+records, which our database can't see, and talks to us only through API
+responses and webhooks. It runs in-process in tests (with an injectable clock)
+or as its own HTTP server (`npm run mock-bank`), and one test drives the whole
+path over real HTTP. Its outcomes are chosen by account number (like Stripe's
+test cards), and its misbehaviour is set at runtime: `outage`, `loseResponses`
+(process the request, then drop the response), `latencyMs`, `settleAfterMs`
+(delayed success), `webhookCopies` (duplicates), `webhooksEnabled`. It retries
+webhooks our endpoint didn't accept.
+
+**Known limits, deliberately deferred:**
+
+- **No cancellation.** Real payout APIs often allow cancelling a payout before
+  it is sent. That would give "the bank never got it" a third option besides
+  waiting and resending.
+- **Payouts don't expire.** One that the bank never receives and that someone
+  never re-queues stays `pending` with its money held. That is safe, but
+  stage 5's dashboard should show old pending payouts.
+- **Discrepancies need a person.** There is no admin action to resolve one yet.
+- **The mock bank's state is in memory.** Restarting it forgets every payout,
+  which the reconciler will (correctly) report as discrepancies.
+
 ### Webhook deduplication
 
 `processed_events` has a primary key of `(provider, event_id)`.
@@ -489,6 +656,16 @@ The tests run against real PostgreSQL. Concurrency bugs don't show up against mo
 | Destination hangs? | `a publish that hangs is timed out and retried, without waiting for the lease` |
 | A client squats an internal idempotency key? | `a client that sends deposit:<id> as its own Idempotency-Key cannot block the deposit from being credited` |
 | A client moves money out of a system account? | `the public API cannot move money out of a system account` |
+| Two payouts overspend? | `10 simultaneous $10 payouts from a $50 account: exactly 5 are held, 5 rejected` |
+| Bank fails or refuses a payout? | `the bank fails it later: the hold is reversed ...`, `the bank refuses it outright (422) ...` |
+| Duplicate bank webhooks? | `every webhook delivered 3 times: applied once ...`, `the same webhook delivered 10 times at once is applied once` |
+| Bank's response lost? | `the bank's response is lost: the retry sends the same key, and the bank pays out once` |
+| **Timeout, then the bank actually paid it out?** | `timeout, then the bank actually paid it out, and no webhook ever came: the status lookup settles it` |
+| Bank outage outlasts every retry? | `an outage outlasts every retry and the bank never got it: the reconciler re-queues it, and it is paid once` |
+| Bank silent: do we fail it on a guess? | `the bank hasn't got it yet but a retry is still scheduled: the reconciler leaves it alone` |
+| Webhooks out of order? | `the webhook beats our own response ...`, `out of order: 'returned' arrives before 'succeeded' ...` |
+| Bank contradicts itself or us? | `the bank contradicts itself ...`, `the bank reports a different amount ...`, `the bank acknowledged a payout and then lost it ...` |
+| All of it at once? | `chaos: 30 payouts through lost responses, an outage, duplicate webhooks and no webhooks ...` |
 
 CI (GitHub Actions) runs the typecheck and the full suite against a Postgres 16 service container.
 
@@ -497,6 +674,6 @@ CI (GitHub Actions) runs the typecheck and the full suite against a Postgres 16 
 1. ✅ **Internal transfers:** accounts, double-entry ledger, `POST /transfers`, idempotency, concurrency.
 2. ✅ **Payments:** Stripe test Checkout, a verified webhook, and a deposit posted from the webhook (not from the success page).
 3. ✅ **Reliability:** a transactional outbox, a concurrent-safe worker with retries and backoff, and idempotency-key scopes.
-4. **Bank connector:** a mock provider with delayed success, failures, duplicate webhooks, and outages.
+4. ✅ **Bank connector:** payouts to a mock bank with delayed success, failures, returns, lost responses, duplicate webhooks and outages, and a reconciler that recovers when the bank and we disagree.
 5. **Reconciliation:** compare the ledger against provider records, with an admin dashboard for unmatched items.
 6. **Dashboard:** a small React UI for balances and history.
