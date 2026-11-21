@@ -9,7 +9,7 @@ process.env.DATABASE_URL ??= "postgres://postgres:postgres@localhost:5432/money_
 export const pool = createPool();
 export const app = buildApp(pool);
 
-/** A system account that can go negative; stands in for deposits until Stripe exists. */
+/** A system account that can go negative. Funding moves out of it with a `system`-scoped transfer, as internal code would. */
 let funding: Promise<string> | undefined;
 function fundingAccount(): Promise<string> {
   funding ??= createAccount(pool, { name: "funding", currency: "USD", kind: "system" }).then((a) => a.id);
@@ -24,7 +24,7 @@ export async function userWithBalance(cents: number, name = "user"): Promise<str
       to_account_id: account.id,
       amount_cents: cents,
       currency: "USD",
-    });
+    }, { scope: "system" });
   }
   return account.id;
 }

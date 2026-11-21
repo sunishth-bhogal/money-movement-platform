@@ -119,7 +119,7 @@ function deliver(event: object, opts: { secret?: string; timestamp?: number; bod
 async function ledgerPostingsFor(depositId: string): Promise<number> {
   const { rows } = await pool.query<{ n: number }>(
     `SELECT count(*)::int AS n FROM ledger_entries e JOIN transfers t ON t.id = e.transfer_id
-      WHERE t.idempotency_key = $1`,
+      WHERE t.idempotency_scope = 'system' AND t.idempotency_key = $1`,
     [`deposit:${depositId}`],
   );
   return rows[0].n;
@@ -361,5 +361,64 @@ describe("payment state", () => {
     expect(unrelated.statusCode).toBe(200);
     expect(unrelated.json().outcome).toBe("ignored");
     expect(await balanceOf(d.account_id)).toBe(0);
+  });
+});
+
+describe("outbox events from the webhook", () => {
+  it("crediting a deposit writes deposit.succeeded and transfer.posted in the same transaction; a duplicate writes none", async () => {
+    const d = await startDeposit(1200);
+    const event = checkoutEvent("checkout.session.completed", d);
+    await deliver(event);
+    await deliver(event);
+
+    const { transfer_id } = await getDeposit(d.id);
+    const { rows } = await pool.query<{ event_type: string; aggregate_id: string; payload: { status: string } }>(
+      `SELECT event_type, aggregate_id, payload FROM outbox
+        WHERE (aggregate_type = 'deposit' AND aggregate_id = $1) OR (aggregate_type = 'transfer' AND aggregate_id = $2)
+        ORDER BY id`,
+      [d.id, transfer_id],
+    );
+    expect(rows.map((r) => [r.event_type, r.aggregate_id])).toEqual([
+      ["transfer.posted", transfer_id],
+      ["deposit.succeeded", d.id],
+    ]);
+  });
+});
+
+describe("idempotency keys: client keys cannot collide with internal ones", () => {
+  it("a client that sends `deposit:<id>` as its own Idempotency-Key cannot block the deposit from being credited", async () => {
+    const d = await startDeposit(2500);
+    const other = await createAccount(pool, { name: "other", currency: "USD" });
+
+    // Squat the key the webhook will use. Even a rejected transfer stores it.
+    const squat = await app.inject({
+      method: "POST",
+      url: "/transfers",
+      headers: { "idempotency-key": `deposit:${d.id}` },
+      payload: { from_account_id: d.account_id, to_account_id: other.id, amount_cents: 1, currency: "USD" },
+    });
+    expect(squat.statusCode).toBe(422);
+
+    // Before scopes, this hit "key reused with a different body" and returned 500 on every Stripe retry.
+    const res = await deliver(checkoutEvent("checkout.session.completed", d));
+    expect(res.statusCode).toBe(200);
+    expect(res.json().outcome).toBe("deposit_succeeded");
+    expect(await balanceOf(d.account_id)).toBe(2500);
+  });
+
+  it("the public API cannot move money out of a system account (which may go negative)", async () => {
+    const d = await startDeposit(100);
+    await deliver(checkoutEvent("checkout.session.completed", d));
+    const { rows } = await pool.query<{ id: string }>("SELECT id FROM accounts WHERE system_code = 'stripe_clearing' AND currency = 'USD'");
+
+    const mint = await app.inject({
+      method: "POST",
+      url: "/transfers",
+      headers: { "idempotency-key": randomUUID() },
+      payload: { from_account_id: rows[0].id, to_account_id: d.account_id, amount_cents: 1_000_000, currency: "USD" },
+    });
+    expect(mint.statusCode).toBe(403);
+    expect(mint.json().error.code).toBe("system_account_not_allowed");
+    expect(await balanceOf(d.account_id)).toBe(100);
   });
 });

@@ -31,5 +31,18 @@ services:
       db:
         condition: service_healthy
 
+  # Publishes outbox events. Scale it (`docker compose up --scale worker=3`):
+  # copies coordinate through Postgres, so each event is claimed by one at a time.
+  worker:
+    build: .
+    command: ["npx", "tsx", "src/outbox/run.ts"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/money_dev
+      # Where to POST events. Unset: events are written to the worker's stdout.
+      OUTBOX_WEBHOOK_URL: ${OUTBOX_WEBHOOK_URL:-}
+    depends_on:
+      db:
+        condition: service_healthy
+
 volumes:
   pgdata:
