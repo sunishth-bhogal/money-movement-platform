@@ -30,11 +30,21 @@ services:
       BANK_API_URL: http://mock-bank:4000
       # The admin API and dashboard (http://localhost:3000/dashboard/). Change it for anything but local demos.
       ADMIN_TOKEN: ${ADMIN_TOKEN:-local-admin-token}
+      # The user wallet (http://localhost:3000/wallet/): signs demo sign-in tokens.
+      WALLET_SESSION_SECRET: ${WALLET_SESSION_SECRET:-local-wallet-secret}
+      # Local demos only: deposits use the demo checkout page when no
+      # STRIPE_SECRET_KEY is set, and the wallet shows the mock bank's switches.
+      DEMO_MODE: ${DEMO_MODE:-true}
     ports:
       - "3000:3000"
     depends_on:
       db:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/health || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
 
   # Publishes outbox events. Scale it (`docker compose up --scale worker=3`):
   # copies coordinate through Postgres, so each event is claimed by one at a time.
@@ -62,6 +72,24 @@ services:
       BANK_WEBHOOK_SECRET: ${BANK_WEBHOOK_SECRET:-local_mock_bank_secret}
     ports:
       - "4000:4000"
+
+  # Seeds Alice, Bob and Carol with a history once the API is up, then exits.
+  # Safe to run again: it uses fixed idempotency keys, so a re-run changes nothing.
+  seed:
+    build: .
+    command: ["npx", "tsx", "scripts/demo-seed.ts"]
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/money_dev
+      API_URL: http://api:3000
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:3000}
+    restart: "no"
+    depends_on:
+      api:
+        condition: service_healthy
+      worker:
+        condition: service_started
+      mock-bank:
+        condition: service_started
 
 volumes:
   pgdata:

@@ -10,10 +10,51 @@ endpoint that is idempotent and safe under concurrency, deposits through
 retries and backoff, **payouts to a mock bank** that is slow, fails, sends
 duplicate webhooks, loses responses and has outages on purpose, and
 **reconciliation** of the ledger against both providers' own records, with a
-small React admin dashboard for what only a person can decide. All money and
-accounts are fictional, and Stripe is only ever used in test mode.
+small React admin dashboard for what only a person can decide, and a **user
+wallet** where a user sees their balances and full history, adds funds, sends
+money and withdraws, with every pending, settled and failed state visible. All
+money and accounts are fictional, and Stripe is only ever used in test mode.
 
-**Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Stripe (test mode), React + Vite (admin dashboard), Vitest, Docker.
+**Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Stripe (test mode), React + Vite (wallet and admin dashboard), Vitest, Docker.
+
+## One-command demo
+
+```bash
+docker compose up --build      # or: npm run demo
+```
+
+This starts Postgres, the API, the outbox worker and the mock bank, then seeds
+Alice, Bob and Carol with a history (the `seed` service prints a summary and
+exits). Open:
+
+- **Wallet:** <http://localhost:3000/wallet/>. Pick a user: sign-in is a demo,
+  no password. Each tab keeps its own sign-in, so Alice and Bob can be open side by side.
+- **Admin dashboard:** <http://localhost:3000/dashboard/>, token `local-admin-token`.
+
+No Stripe account is needed: with `DEMO_MODE=true` (the compose default) and no
+`STRIPE_SECRET_KEY`, **Add funds** opens a demo checkout page instead of Stripe
+(see [the wallet](#the-wallet-user-dashboard)). Set test-mode Stripe keys and it
+uses real Stripe Checkout instead.
+
+Things to try in the wallet:
+
+| Try | What you see |
+|---|---|
+| Right after seeding | Four withdrawals go from *Pending* to *Settled* (••1111), *Failed, refunded* (••0002 and ••0004) and *Returned* (••0005) as the worker and the mock bank play them out. Changed rows flash. |
+| **Send money**, then *Double-click test* (or just double-click **Send**) | Two requests, one transfer: "Sent 2 times with the same Idempotency-Key, and it moved money once." One row in the activity. |
+| Send more than you have | A *Failed* row for the sender ("Not enough money"), nothing for the recipient, no money moved. |
+| **Add funds** → *Pay, and deliver the webhook twice* | The deposit is *Pending* until the signed webhook arrives, then credited once; the second delivery is a duplicate. |
+| **Add funds** → *Pay by bank debit, which then fails* / *Abandon* | *Payment processing* then *Payment failed*, or *Checkout abandoned*. Nothing credited. |
+| **Withdraw** to *Closed account ••0002* | *Pending* with the money on hold, then *Bank failed it, refunded*. Open the row: a hold and a release in the ledger, never an edit. |
+| *Make the bank misbehave* → **Bank outage**, then withdraw | Stays *Pending* while the worker retries with backoff; switch the outage off and it settles. |
+| **Lose the next response** / **Send every webhook twice** | Still exactly one payout at the bank and one settlement. |
+| **Stop sending webhooks**, then withdraw | Stays *Bank is processing*. The worker's status check (every 30s by default) or **Run reconciliation** in the admin dashboard finds it paid. |
+
+Running the seed again (`docker compose run --rm seed`) changes nothing: every
+request it makes has a fixed idempotency key, so each one is answered from the
+first run. The wallet can also be run in development with `npm run wallet`
+(Vite on :5174, proxying `/me` to the API) after `npm run dev`; seed with
+`npm run demo:seed` (needs the API running, with `WALLET_SESSION_SECRET` set).
 
 ## Quick start
 
@@ -31,6 +72,7 @@ npm run worker      # outbox worker: prints events (or POSTs them to OUTBOX_WEBH
                     # and sends payouts to the bank when BANK_API_URL is set
 npm run mock-bank   # the fake bank on :4000 (needs BANK_WEBHOOK_SECRET, see .env.example)
 npm run dashboard   # the admin dashboard on :5173 (needs ADMIN_TOKEN on the API)
+npm run wallet      # the user wallet on :5174 (needs WALLET_SESSION_SECRET on the API)
 
 # tests run against a real Postgres (money_test), not mocks
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/money_test npm test
@@ -162,6 +204,27 @@ went from 5000 to 4000 exactly once.
 | `GET` | `/payouts/:id` | Payout status: `pending`, `submitted`, `succeeded`, `failed`, `returned` or `rejected`, plus any `discrepancy`. |
 | `POST` | `/webhooks/bank` | Mock bank events. Requires a valid `Bank-Signature` (HMAC-SHA256). Same status codes as the Stripe webhook. |
 | `POST` | `/webhooks/stripe` | Stripe events. Requires a valid `Stripe-Signature`. `400` if verification fails, `200` once processed (or a duplicate), `500` on an error so Stripe retries. |
+
+The wallet API (`/me`) is what the user wallet calls. Every route except the
+first three needs `Authorization: Bearer <token from POST /me/session>` (`401`
+without a valid one, `503` if `WALLET_SESSION_SECRET` is unset), and acts only
+on that user's account:
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/me/config` | What the server has switched on: `deposits` is `stripe_test`, `demo_checkout` or `disabled`. |
+| `GET` | `/me/demo-users` | The user accounts, for the demo sign-in screen. |
+| `POST` | `/me/session` | `{ account_id }` → `{ token, expires_at, account }`. Demo sign-in: no password. |
+| `GET` | `/me` | `available_cents`, `on_hold_cents` (withdrawals not yet paid out), `incoming_cents` (deposits awaiting payment). |
+| `GET` | `/me/activity` | The feed, newest first: one row per deposit, withdrawal, transfer or adjustment, each `pending`, `settled` or `failed`. `?limit=&before=<next_cursor>` |
+| `GET` | `/me/statement` | Every ledger posting on the account with the balance after it. `?limit=&before=<entry id>` |
+| `GET` | `/me/payees` | Other users you can send to. |
+| `POST` | `/me/transfers` | `Idempotency-Key` required. `{ to_account_id, amount_cents }`. `201 { item, replayed }`, or `422` with a `failed` item. |
+| `POST` | `/me/deposits` | `Idempotency-Key` required. `{ amount_cents }`. `201 { item, replayed, checkout_url }`. Moves no money. |
+| `GET` | `/me/deposits/:id` | One of your deposits, as a feed row. |
+| `POST` | `/me/payouts` | `Idempotency-Key` required. `{ amount_cents, bank_account_number }`. Holds the money: `201` with a `pending` item, or `422` with a `failed` one. |
+| `POST` | `/me/deposits/:id/demo-checkout` | `DEMO_MODE` only. `{ outcome: "pay" \| "pay_duplicate_webhook" \| "bank_debit_fails" \| "abandon" }`. Sends the matching signed Stripe events to `/webhooks/stripe`. |
+| `GET` / `POST` | `/me/demo/bank` | `DEMO_MODE` only. The mock bank's `outage`, `loseResponses`, `webhookCopies` and `webhooksEnabled` switches. |
 
 The admin API needs `Authorization: Bearer <ADMIN_TOKEN>` (`401` without it, `503` if `ADMIN_TOKEN` is unset):
 
@@ -334,7 +397,8 @@ retry with the same key", never "definitely did not happen".
 
 **Known limits, deliberately deferred:**
 
-- Keys are global. Once there is auth, they should be scoped per client
+- Keys are global on the raw API (the wallet scopes its keys per user, see
+  [the wallet](#the-wallet-user-dashboard)). Once there is auth, they should be scoped per client
   (`UNIQUE (client_id, idempotency_key)`).
 - Keys never expire. Stripe keeps them for 24h. Here the transfer row doubles as
   the record, so keeping it forever costs nothing extra.
@@ -807,6 +871,59 @@ reconciliation compares, session by session, with Stripe's own records.
   Sessions that expired without payment are left `pending` (no money is at
   stake); syncing that label is a small follow-up.
 
+### The wallet (user dashboard)
+
+The wallet ([`wallet/`](wallet/), served at `/wallet/`) is a React app over a
+small user-facing API ([`src/wallet/`](src/wallet/)). It adds no new way to
+move money: transfers, deposits and withdrawals go through the same
+`createTransfer`, `createDeposit` and `createPayout` as the rest of the API, so
+every guarantee above applies unchanged. What it adds:
+
+- **Demo sign-in, real authorisation.** You pick a user and get an
+  HMAC-signed token naming their account (12 hours). There are no passwords,
+  which is fine for fictional money, but no `/me` route takes an account id
+  to act on: the money always comes from the account in the token, and other
+  users' deposits answer `404`. Real auth would replace how the token is
+  issued, not how it is checked.
+- **Idempotency keys come from the browser, one per intention.** A form makes
+  a key the first time it sends and keeps it while its fields are unchanged
+  ([`wallet/src/idempotent.ts`](wallet/src/idempotent.ts)). A double-click, a
+  second press after a slow answer, or a retry after "no answer from the
+  server" all reuse it, so they are answered from the first request. Editing a
+  field or pressing *Start a new one* is a new intention and a new key. When
+  the outcome is unknown (network error or `5xx`) the wallet says so, and says
+  pressing again is safe.
+- **Keys are scoped per user.** The server stores wallet keys as
+  `wallet:<account id>:<key>`, so two users sending the same key get two
+  operations, and nobody can replay or block someone else's request by
+  guessing its key. (This closes, for the wallet, the "keys are global" limit
+  noted under idempotency.)
+- **One feed row per thing, with honest states.** A withdrawal is one row
+  whose state follows the payout: *pending* while held, *settled* when the bank
+  paid it, *failed* if the bank failed or returned it. Each row has
+  `balance_effect_cents` (what it does to the balance right now: a failed
+  withdrawal's is 0, because its hold was released) and, when opened, the ledger
+  postings behind it. The *Ledger statement* tab lists every posting with a
+  running balance, so the feed can always be checked against the ledger.
+- **A deposit is pending until the webhook says otherwise.** Coming back from
+  Checkout shows *pending* and a note that the money arrives with the verified
+  webhook, not with the browser.
+- **The demo checkout is the real webhook path minus Stripe's servers.** With
+  `DEMO_MODE=true` and no `STRIPE_SECRET_KEY`, *Add funds* opens a wallet page
+  in place of Stripe Checkout. Choosing an outcome builds the Checkout Session
+  events Stripe would send, signs them with the webhook secret using Stripe's
+  SDK, and posts them to `/webhooks/stripe`, where signature verification,
+  `processed_events` dedupe and the deposit state machine run exactly as for
+  Stripe. It is refused for deposits it did not open and for other users'
+  deposits, and it is never on when a Stripe key is set. `DEMO_MODE` lets any
+  signed-in user mint fictional money and flip the bank's switches, so it is
+  for local demos only.
+- **Live without websockets.** The wallet polls every 2 seconds while the tab
+  is visible and highlights rows whose status changed.
+
+Migration `006` adds indexes on `transfers (from_account_id)` and
+`(to_account_id)` for the feed.
+
 ## Tests
 
 The tests run against real PostgreSQL. Concurrency bugs don't show up against mocks.
@@ -862,8 +979,13 @@ The tests run against real PostgreSQL. Concurrency bugs don't show up against mo
 | Double-clicked "Resolve"? | `10 simultaneous clicks on 'accept' post one correction ...` |
 | A webhook fixes it while a person decides? | `if the money moved since the run looked, the correction is refused rather than applied twice` |
 | Can the evidence be rewritten? | `runs, items and resolutions are evidence: they cannot be edited or deleted` |
+| Double-clicked "Send" in the wallet? | `a double-click (two requests, one key) moves money once`, `25 concurrent clicks with one key post one transfer`, `a double-clicked withdrawal holds the money once` |
+| Two users happen to send the same key? | `keys are per user: the same key from two users is two transfers` |
+| Can a user act on someone else's account? | `always sends from the signed-in account ...`, `only the deposit's owner can see or complete it`, `rejects a missing, forged, tampered or expired token` |
+| Does the wallet show the right state? | `stays pending until the (signed) webhook arrives, then settles once even if delivered twice`, `holds the money while pending, then settles, or fails and refunds` (with the statement's running balance) |
+| Does the form reuse its key? | `reuses the key while the form says the same thing ...`, `makes a new key when the form changes ...` (`test/wallet-client.test.ts`) |
 
-CI (GitHub Actions) runs the typecheck (API and dashboard), builds the dashboard, and runs the full suite against a Postgres 16 service container.
+CI (GitHub Actions) runs the typecheck (API, dashboard and wallet), builds the dashboard and the wallet, and runs the full suite against a Postgres 16 service container.
 
 ## Roadmap
 
@@ -872,4 +994,4 @@ CI (GitHub Actions) runs the typecheck (API and dashboard), builds the dashboard
 3. ✅ **Reliability:** a transactional outbox, a concurrent-safe worker with retries and backoff, and idempotency-key scopes.
 4. ✅ **Bank connector:** payouts to a mock bank with delayed success, failures, returns, lost responses, duplicate webhooks and outages, and a reconciler that recovers when the bank and we disagree.
 5. ✅ **Reconciliation:** compare the ledger against the bank's and Stripe's records, prove the totals tie out, fix what the provider's record settles, and an admin dashboard where a person resolves the rest as auditable ledger postings.
-6. **Dashboard:** a small React UI for balances and history.
+6. ✅ **User dashboard:** a React wallet for balances and full history, adding funds (Stripe test Checkout, or a demo checkout), transfers and withdrawals, with client-side idempotency keys, and a one-command seeded demo with switches for the bank's failure modes.

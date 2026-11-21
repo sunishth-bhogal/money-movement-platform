@@ -8,11 +8,15 @@
     "worker": "tsx src/outbox/run.ts",
     "migrate": "tsx src/migrate.ts",
     "seed": "tsx scripts/seed.ts",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p dashboard",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p dashboard && tsc --noEmit -p wallet",
     "test": "vitest run",
     "mock-bank": "tsx src/bank/run.ts",
     "dashboard": "vite --config dashboard/vite.config.ts",
-    "dashboard:build": "vite build --config dashboard/vite.config.ts"
+    "dashboard:build": "vite build --config dashboard/vite.config.ts",
+    "wallet": "vite --config wallet/vite.config.ts",
+    "wallet:build": "vite build --config wallet/vite.config.ts",
+    "demo": "docker compose up --build",
+    "demo:seed": "tsx scripts/demo-seed.ts"
   },
   "license": "MIT",
   "dependencies": {

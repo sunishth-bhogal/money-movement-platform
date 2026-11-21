@@ -29,4 +29,5 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run dashboard:build
+      - run: npm run wallet:build
       - run: npm test
