@@ -3,12 +3,14 @@
 A fictional money movement platform built in stages, with a focus on one thing:
 **staying correct when requests are duplicated, raced, or lost.**
 
-This first stage is the core: accounts, an immutable double-entry ledger, and an
-internal `POST /transfers` endpoint that is idempotent and safe under concurrency.
-Stripe test payments, the outbox worker, a mock bank connector, and reconciliation
-come next (see [Roadmap](#roadmap)). All money and accounts are fictional.
+So far: accounts, an immutable double-entry ledger, an internal `POST /transfers`
+endpoint that is idempotent and safe under concurrency, and deposits through
+**Stripe Checkout in test mode**, credited only by a verified webhook. The outbox
+worker, a mock bank connector, and reconciliation come next (see
+[Roadmap](#roadmap)). All money and accounts are fictional, and Stripe is only
+ever used in test mode.
 
-**Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Vitest, Docker.
+**Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Stripe (test mode), Vitest, Docker.
 
 ## Quick start
 
@@ -28,6 +30,36 @@ DATABASE_URL=postgres://postgres:postgres@localhost:5432/money_test npm test
 ```
 
 Or run the API and database together with `docker compose up --build`.
+
+The tests need no Stripe account: webhook signatures are generated with Stripe's
+SDK against a throwaway secret, and the Checkout API is faked.
+
+### Demo: add funds with Stripe Checkout (test mode)
+
+You need a Stripe account in **test mode** and the [Stripe CLI](https://docs.stripe.com/stripe-cli).
+
+```bash
+# 1. Forward Stripe test events to the local API. It prints a whsec_... secret.
+stripe listen --forward-to localhost:3000/webhooks/stripe
+
+# 2. In .env (gitignored), set your test keys:
+#    STRIPE_SECRET_KEY=sk_test_...      (the server refuses live keys)
+#    STRIPE_WEBHOOK_SECRET=whsec_...    (from step 1)
+npm run dev
+
+# 3. Start a $25.00 deposit for Bob
+curl -s -X POST localhost:3000/deposits \
+  -H 'content-type: application/json' \
+  -H 'Idempotency-Key: deposit-demo-1' \
+  -d '{"account_id":"<bob>","amount_cents":2500,"currency":"USD"}'
+```
+
+Open the returned `checkout_url` and pay with the test card `4242 4242 4242 4242`
+(any future date, any CVC). **Close the tab instead of waiting for the redirect.**
+`stripe listen` shows `checkout.session.completed` being delivered, and
+`GET /deposits/<id>` reports `succeeded`, with Bob's balance up by 2500. The
+browser never had to come back. Run `stripe events resend <evt_id>` to redeliver
+the event: the response says `"outcome":"duplicate"` and the balance does not change.
 
 ### Demo: the same transfer sent twice moves money once
 
@@ -51,6 +83,9 @@ went from 5000 to 4000 exactly once.
 | `GET` | `/accounts/:id/entries` | Ledger history, newest first. `?limit=&before=<entry id>` |
 | `POST` | `/transfers` | Requires an `Idempotency-Key` header. Body: `{ from_account_id, to_account_id, amount_cents, currency }` |
 | `GET` | `/transfers/:id` | |
+| `POST` | `/deposits` | Requires an `Idempotency-Key` header. Body: `{ account_id, amount_cents, currency }`. Returns a `pending` deposit with a Stripe `checkout_url`. Moves no money. |
+| `GET` | `/deposits/:id` | Deposit status. Also the Checkout success/cancel page; visiting it changes nothing. |
+| `POST` | `/webhooks/stripe` | Stripe events. Requires a valid `Stripe-Signature`. `400` if verification fails, `200` once processed (or a duplicate), `500` on an error so Stripe retries. |
 
 `POST /transfers` responses:
 
@@ -72,9 +107,11 @@ accounts          id, name, currency, kind (user|system), balance_cents
 transfers         id, idempotency_key UNIQUE, request_hash, from/to, amount_cents, status (posted|rejected)
 ledger_entries    id, transfer_id, account_id, amount_cents (signed), currency   -- append-only
 processed_events  (provider, event_id) PRIMARY KEY, event_type, payload          -- webhook inbox
+deposits          id, idempotency_key UNIQUE, account_id, amount_cents, status,
+                  stripe_checkout_session_id UNIQUE, transfer_id UNIQUE           -- Stripe Checkout state
 ```
 
-See [`migrations/001_init.sql`](migrations/001_init.sql).
+See [`migrations/`](migrations/).
 
 ## Design notes
 
@@ -183,7 +220,7 @@ result. Money moves once.
   outbox, so external calls are retried from durable state rather than from
   memory.
 
-### Webhook deduplication (groundwork)
+### Webhook deduplication
 
 `processed_events` has a primary key of `(provider, event_id)`.
 `recordEventOnce()` inserts with `ON CONFLICT DO NOTHING` and must be called
@@ -191,7 +228,86 @@ result. Money moves once.
 delivery is skipped. If applying the event crashes, the record rolls back with
 the effects, so the provider's redelivery is processed instead of being lost.
 Tests cover redelivery, 10 concurrent deliveries, and crash-then-redeliver.
-Stage 1 wires this to Stripe webhooks.
+
+### Deposits: Stripe Checkout and a verified webhook
+
+Code: [`src/payments/`](src/payments/). Test mode only: the server refuses to
+start with a key that isn't `sk_test_`/`rk_test_`, and the webhook rejects any
+event with `livemode: true`.
+
+**The success page credits nothing.** A browser redirect proves nothing (anyone
+can type the URL), and many users close the tab after paying, so it may never
+arrive. Money moves only when Stripe tells the server directly, through a signed
+webhook. `GET /deposits/:id` (the success URL) just shows the current status, so
+a client shows "pending" until the webhook lands, usually within seconds.
+
+**The deposit is a state machine, recorded in Postgres:**
+
+```
+created ─► pending ─┬─(paid)─────────────────────────────► succeeded
+                    ├─(async method) ► processing ─┬─────► succeeded
+                    │                              └─────► failed
+                    ├─(session expired)──────────────────► expired
+                    └─(paid amount ≠ requested)──────────► requires_review
+```
+
+**Creating a deposit is two steps, because a Stripe call can't be inside a
+database transaction.** First, a `created` row is committed under the client's
+`Idempotency-Key`. Then Stripe is called with its own idempotency key,
+`deposit-checkout:<deposit id>`, and the session is saved as `pending`. If the
+Stripe call fails or the process dies between the two, the row stays `created`.
+A retry with the same key repeats only the Stripe call, and Stripe's idempotency
+returns the same session, so the user never gets two Checkout pages for one click.
+The deposit id goes to Stripe as `client_reference_id`, so the webhook can find
+the deposit even if the session id was never saved.
+
+**Verifying the webhook.** Stripe signs `timestamp.raw_body` with HMAC-SHA256
+using the endpoint's secret. The route keeps the body as the raw bytes (in its
+own Fastify scope, so other routes still parse JSON normally), and
+`stripe.webhooks.constructEvent` checks the signature and rejects timestamps
+more than 5 minutes old, which stops replays of a captured request. A failed
+check returns `400` before anything is written. Re-serialising parsed JSON would
+change the bytes and break verification, which is why the raw body matters.
+
+**Posting exactly once.** One transaction records the event in
+`processed_events`, locks the deposit row, moves its status, and posts a normal
+double-entry transfer from a `Stripe clearing` system account to the user. It
+either all commits or none of it does. Three layers stop a double credit:
+
+1. **Same event twice** (Stripe retries on any timeout, so this is routine): the
+   `processed_events` primary key. A duplicate gets `200` with
+   `outcome: "duplicate"`, so Stripe stops retrying.
+2. **Different events for one payment** (e.g. `checkout.session.completed` and
+   then `async_payment_succeeded`): the deposit row is locked `FOR UPDATE` and
+   only a non-final deposit is credited.
+3. **Backstops in the schema:** the ledger transfer's idempotency key is
+   `deposit:<id>`, `deposits.transfer_id` is unique, and a `CHECK` requires
+   `status = 'succeeded'` exactly when `transfer_id` is set.
+
+If processing throws, the route returns `500` and the rollback leaves no trace,
+so Stripe's next retry starts clean. Lock order is deposit row, then account
+rows, and nothing locks them the other way round, so this can't deadlock with
+transfers.
+
+**What we refuse to guess.** If a paid session's amount or currency differs from
+the deposit, the deposit goes to `requires_review` and nothing is credited.
+Events for unknown deposits, for a session we didn't create, or of types we
+don't handle are recorded and acknowledged (`outcome: "ignored"`).
+
+**The clearing account.** `Stripe clearing (USD)` is a `system` account created
+on first use. It goes negative by the amount Stripe holds for us, which is what
+reconciliation (stage 5) will compare against Stripe's balance.
+
+**Known limits, deliberately deferred:**
+
+- Refunds, disputes and chargebacks are not handled yet. They will be reversing
+  transfers out of the user account.
+- Handling is synchronous inside the webhook request. That is fine at this
+  volume. Stage 3 moves the work behind an inbox/outbox so the endpoint only
+  records and acknowledges.
+- If webhooks stop arriving altogether (endpoint misconfigured, outage), deposits
+  stay `pending`. A sweeper that asks Stripe about old `pending` sessions belongs
+  with reconciliation.
 
 ## Tests
 
@@ -205,15 +321,22 @@ The tests run against real PostgreSQL. Concurrency bugs don't show up against mo
 | Deadlocks? | `transfers in opposite directions ... do not deadlock`, `a ring of concurrent transfers` |
 | What if the app code is wrong? | `without row locks, a naive check-then-write would overspend; the CHECK constraint stops it`, `refuses to commit entries that do not sum to zero` |
 | Can history be rewritten? | `refuses UPDATE, DELETE and TRUNCATE` |
-| Same webhook twice? | `processed_events deduplicates external events` |
+| Same webhook twice? | `processed_events deduplicates external events`, `the same event delivered twice` |
+| Same webhook 10× at once? | `the same event delivered 10 times concurrently` |
+| Two different events for one payment? | `two different events for the same payment (completed, then async_payment_succeeded)` |
+| Forged or tampered webhook? | `rejects a bad signature and records nothing`, `rejects a body that was changed after signing`, `... a replayed old one` |
+| User closes the browser after paying? | `a user who pays and closes the browser is still credited, by the webhook` |
+| Does the success page move money? | `landing on the success page changes nothing` |
+| Stripe times out while creating Checkout? | `if Stripe fails, the deposit stays 'created' and a retry reuses the same Stripe idempotency key` |
+| Stripe charged a different amount? | `a paid amount that differs from the deposit is held for review, not credited` |
 
 CI (GitHub Actions) runs the typecheck and the full suite against a Postgres 16 service container.
 
 ## Roadmap
 
 1. ✅ **Internal transfers:** accounts, double-entry ledger, `POST /transfers`, idempotency, concurrency.
-2. **Payments:** Stripe test Checkout, a verified webhook, and a deposit posted from the webhook (not from the success page).
-3. **Reliability:** an outbox worker, retries with backoff, and webhook dedup wired to Stripe.
+2. ✅ **Payments:** Stripe test Checkout, a verified webhook, and a deposit posted from the webhook (not from the success page).
+3. **Reliability:** an outbox worker, retries with backoff, and webhook processing moved behind an inbox.
 4. **Bank connector:** a mock provider with delayed success, failures, duplicate webhooks, and outages.
 5. **Reconciliation:** compare the ledger against provider records, with an admin dashboard for unmatched items.
 6. **Dashboard:** a small React UI for balances and history.

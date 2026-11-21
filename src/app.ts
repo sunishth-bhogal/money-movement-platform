@@ -4,6 +4,8 @@ import { z } from "zod";
 import { ApiError } from "./errors.js";
 import { createAccount, getAccount, listEntries } from "./ledger/accounts.js";
 import { createTransfer, getTransfer, type Transfer } from "./ledger/transfers.js";
+import { createDeposit, getDeposit, handleStripeEvent, type Deposit } from "./payments/deposits.js";
+import { verifyStripeEvent, type PaymentsConfig } from "./payments/stripe.js";
 
 const uuid = z.string().uuid();
 const currency = z.string().regex(/^[A-Z]{3}$/, "ISO 4217 code, e.g. USD");
@@ -16,6 +18,13 @@ const transferBody = z.object({
   currency,
 });
 
+// Stripe Checkout caps a single payment at $999,999.99.
+const depositBody = z.object({
+  account_id: uuid,
+  amount_cents: z.number().int().positive().max(99_999_999),
+  currency,
+});
+
 const accountBody = z.object({ name: z.string().min(1).max(200), currency });
 
 // Keys are client-generated (a UUID v4 is ideal). Bounded so they can't be used to bloat the index.
@@ -25,7 +34,23 @@ function serializeTransfer(t: Transfer) {
   return { ...t, created_at: t.created_at.toISOString() };
 }
 
-export function buildApp(pool: pg.Pool, opts: { logger?: boolean } = {}): FastifyInstance {
+function serializeDeposit(d: Deposit) {
+  return { ...d, created_at: d.created_at.toISOString(), updated_at: d.updated_at.toISOString() };
+}
+
+function requireIdempotencyKey(header: unknown): string {
+  const parsed = idempotencyKey.safeParse(header);
+  if (!parsed.success) {
+    throw new ApiError(400, "idempotency_key_required", "Send an Idempotency-Key header (8-255 chars).");
+  }
+  return parsed.data;
+}
+
+export function buildApp(
+  pool: pg.Pool,
+  opts: { logger?: boolean; payments?: PaymentsConfig } = {},
+): FastifyInstance {
+  const payments: PaymentsConfig = opts.payments ?? { appBaseUrl: "http://localhost:3000" };
   const app = Fastify({ logger: opts.logger ?? false });
 
   app.setErrorHandler((err, _req, reply) => {
@@ -70,13 +95,9 @@ export function buildApp(pool: pg.Pool, opts: { logger?: boolean } = {}): Fastif
   });
 
   app.post("/transfers", async (req, reply) => {
-    const keyHeader = req.headers["idempotency-key"];
-    const parsedKey = idempotencyKey.safeParse(keyHeader);
-    if (!parsedKey.success) {
-      throw new ApiError(400, "idempotency_key_required", "Send an Idempotency-Key header (8-255 chars).");
-    }
+    const key = requireIdempotencyKey(req.headers["idempotency-key"]);
     const body = transferBody.parse(req.body);
-    const { transfer, replayed } = await createTransfer(pool, parsedKey.data, body);
+    const { transfer, replayed } = await createTransfer(pool, key, body);
 
     if (replayed) reply.header("Idempotent-Replayed", "true");
     if (transfer.status === "rejected") {
@@ -95,6 +116,59 @@ export function buildApp(pool: pg.Pool, opts: { logger?: boolean } = {}): Fastif
     const transfer = await getTransfer(pool, id);
     if (!transfer) throw new ApiError(404, "transfer_not_found", "Transfer not found.");
     return serializeTransfer(transfer);
+  });
+
+  // ---- Deposits (Stripe Checkout, test mode) --------------------------------
+
+  app.post("/deposits", async (req, reply) => {
+    if (!payments.gateway) {
+      throw new ApiError(503, "payments_not_configured", "Set STRIPE_SECRET_KEY (a test-mode key) to enable deposits.");
+    }
+    const key = requireIdempotencyKey(req.headers["idempotency-key"]);
+    const body = depositBody.parse(req.body);
+    const { deposit, replayed } = await createDeposit(pool, payments.gateway, key, body, payments.appBaseUrl);
+    if (replayed) reply.header("Idempotent-Replayed", "true");
+    return reply.status(201).send(serializeDeposit(deposit));
+  });
+
+  // Also the Checkout success/cancel URL. Landing here credits nothing: the
+  // status only changes when the verified webhook arrives, so a client should
+  // show "pending" until it does.
+  app.get("/deposits/:id", async (req) => {
+    const id = uuid.parse((req.params as { id: string }).id);
+    const deposit = await getDeposit(pool, id);
+    if (!deposit) throw new ApiError(404, "deposit_not_found", "Deposit not found.");
+    return serializeDeposit(deposit);
+  });
+
+  // Signature verification needs the exact bytes Stripe signed, so this route
+  // lives in its own scope where JSON bodies are kept as a raw Buffer.
+  app.register(async (scope) => {
+    scope.addContentTypeParser("application/json", { parseAs: "buffer" }, (_req, body, done) => done(null, body));
+
+    scope.post("/webhooks/stripe", async (req, reply) => {
+      if (!payments.webhookSecret) {
+        throw new ApiError(503, "payments_not_configured", "Set STRIPE_WEBHOOK_SECRET to accept Stripe webhooks.");
+      }
+      const signature = req.headers["stripe-signature"];
+      if (typeof signature !== "string" || !Buffer.isBuffer(req.body)) {
+        throw new ApiError(400, "invalid_signature", "Missing Stripe-Signature header or JSON body.");
+      }
+      let event;
+      try {
+        event = verifyStripeEvent(req.body, signature, payments.webhookSecret);
+      } catch {
+        // Nothing is recorded for an unverified request.
+        throw new ApiError(400, "invalid_signature", "Webhook signature verification failed.");
+      }
+      if (event.livemode) {
+        throw new ApiError(400, "livemode_not_allowed", "Only Stripe test-mode events are accepted.");
+      }
+      // A thrown error becomes a 500, so Stripe retries. Because processing is
+      // one transaction, a failed attempt leaves nothing behind.
+      const result = await handleStripeEvent(pool, event);
+      return reply.status(200).send({ received: true, ...result });
+    });
   });
 
   return app;
