@@ -4,7 +4,7 @@ import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import { checkLedgerInvariants, createAccount } from "../src/ledger/accounts.js";
 import type { CheckoutGateway } from "../src/payments/stripe.js";
-import { balanceOf, pool } from "./helpers.js";
+import { AS_OPERATOR, balanceOf, operatorAuth, pool } from "./helpers.js";
 
 // A made-up signing secret. Signatures are computed with Stripe's own SDK, so
 // the verification path under test is the real one; no Stripe keys needed.
@@ -28,6 +28,7 @@ class FakeGateway implements CheckoutGateway {
 
 let gateway: FakeGateway;
 const app = buildApp(pool, {
+  ...operatorAuth,
   payments: {
     gateway: { createCheckoutSession: (i, k) => gateway.createCheckoutSession(i, k) },
     webhookSecret: WEBHOOK_SECRET,
@@ -57,7 +58,7 @@ interface DepositJson {
 }
 
 function postDeposit(key: string, body: Record<string, unknown>) {
-  return app.inject({ method: "POST", url: "/deposits", headers: { "idempotency-key": key }, payload: body });
+  return app.inject({ method: "POST", url: "/deposits", headers: { ...AS_OPERATOR, "idempotency-key": key }, payload: body });
 }
 
 async function startDeposit(amount_cents = 2500): Promise<DepositJson> {
@@ -68,7 +69,7 @@ async function startDeposit(amount_cents = 2500): Promise<DepositJson> {
 }
 
 async function getDeposit(id: string): Promise<DepositJson> {
-  return (await app.inject({ method: "GET", url: `/deposits/${id}` })).json();
+  return (await app.inject({ method: "GET", url: `/deposits/${id}`, headers: AS_OPERATOR })).json();
 }
 
 /** A Stripe-shaped checkout.session.* event for a deposit. */
@@ -188,11 +189,11 @@ describe("POST /deposits", () => {
   });
 
   it("returns 503 when Stripe is not configured", async () => {
-    const bare = buildApp(pool, { payments: { appBaseUrl: "http://localhost:3000" } });
+    const bare = buildApp(pool, { ...operatorAuth, payments: { appBaseUrl: "http://localhost:3000" } });
     const res = await bare.inject({
       method: "POST",
       url: "/deposits",
-      headers: { "idempotency-key": randomUUID() },
+      headers: { ...AS_OPERATOR, "idempotency-key": randomUUID() },
       payload: { account_id: randomUUID(), amount_cents: 100, currency: "USD" },
     });
     expect(res.statusCode).toBe(503);
@@ -394,7 +395,7 @@ describe("idempotency keys: client keys cannot collide with internal ones", () =
     const squat = await app.inject({
       method: "POST",
       url: "/transfers",
-      headers: { "idempotency-key": `deposit:${d.id}` },
+      headers: { ...AS_OPERATOR, "idempotency-key": `deposit:${d.id}` },
       payload: { from_account_id: d.account_id, to_account_id: other.id, amount_cents: 1, currency: "USD" },
     });
     expect(squat.statusCode).toBe(422);
@@ -414,7 +415,7 @@ describe("idempotency keys: client keys cannot collide with internal ones", () =
     const mint = await app.inject({
       method: "POST",
       url: "/transfers",
-      headers: { "idempotency-key": randomUUID() },
+      headers: { ...AS_OPERATOR, "idempotency-key": randomUUID() },
       payload: { from_account_id: rows[0].id, to_account_id: d.account_id, amount_cents: 1_000_000, currency: "USD" },
     });
     expect(mint.statusCode).toBe(403);

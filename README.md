@@ -105,6 +105,7 @@ npm run dev
 
 # 3. Start a $25.00 deposit for Bob
 curl -s -X POST localhost:3000/deposits \
+  -H 'Authorization: Bearer local-admin-token' \
   -H 'content-type: application/json' \
   -H 'Idempotency-Key: deposit-demo-1' \
   -d '{"account_id":"<bob>","amount_cents":2500,"currency":"USD"}'
@@ -127,6 +128,7 @@ curl -s -X POST localhost:4000/_admin/behaviour -H 'content-type: application/js
   -d '{"loseResponses":1,"webhookCopies":2}'
 
 curl -s -X POST localhost:3000/payouts \
+  -H 'Authorization: Bearer local-admin-token' \
   -H 'content-type: application/json' \
   -H 'Idempotency-Key: payout-demo-1' \
   -d '{"account_id":"<alice>","amount_cents":2000,"currency":"USD","bank_account_number":"000123451111"}'
@@ -155,6 +157,7 @@ next response and stop sending webhooks, so nobody tells us how the payout ends:
 curl -s -X POST localhost:4000/_admin/behaviour -H 'content-type: application/json' \
   -d '{"loseResponses":1,"webhooksEnabled":false}'
 curl -s -X POST localhost:3000/payouts -H 'content-type: application/json' \
+  -H 'Authorization: Bearer local-admin-token' \
   -H 'Idempotency-Key: recon-demo-1' \
   -d '{"account_id":"<alice>","amount_cents":700,"currency":"USD","bank_account_number":"000123451111"}'
 ```
@@ -185,6 +188,7 @@ clean. The same API is under `/admin` (see below).
 
 ```bash
 curl -i -X POST localhost:3000/transfers \
+  -H 'Authorization: Bearer local-admin-token' \
   -H 'content-type: application/json' \
   -H 'Idempotency-Key: 6f1c0a52-demo' \
   -d '{"from_account_id":"<alice>","to_account_id":"<bob>","amount_cents":1000,"currency":"USD"}'
@@ -195,6 +199,17 @@ carries `Idempotent-Replayed: true`, and Alice's balance (`GET /accounts/<alice>
 went from 5000 to 4000 exactly once.
 
 ## API
+
+Every route below except the webhooks and `/health` needs a caller:
+`Authorization: Bearer <ADMIN_TOKEN>` for an operator, who may act on any user
+account, or a wallet session token from `POST /me/session` for a user, who may
+only see and move their own money (`403` for someone else's account in a
+request body, `404` for someone else's transfer, deposit or payout). No valid
+token is a `401`; with neither `ADMIN_TOKEN` nor `WALLET_SESSION_SECRET` set,
+`503`. Users' `Idempotency-Key`s are namespaced by account, like the wallet's.
+`POST /accounts` is operator-only. `GET /deposits/:id` without any
+`Authorization` header (the browser coming back from Checkout) answers only
+`{ id, status }`.
 
 | Method | Path | Notes |
 |---|---|---|

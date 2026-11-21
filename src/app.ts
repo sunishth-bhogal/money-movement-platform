@@ -1,6 +1,7 @@
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, { type FastifyInstance, type FastifyRequest } from "fastify";
 import type pg from "pg";
 import { z } from "zod";
+import { authenticate, canSee, hasCredentials, requireOperator, requireOwnAccount, scopeKey } from "./auth/apiAuth.js";
 import { ApiError } from "./errors.js";
 import { createAccount, getAccount, listEntries } from "./ledger/accounts.js";
 import { createTransfer, getTransfer, type Transfer } from "./ledger/transfers.js";
@@ -99,30 +100,42 @@ export function buildApp(
     return { ok: true };
   });
 
+  // ---- The core API: operators (ADMIN_TOKEN) or signed-in users -------------
+  // See src/auth/apiAuth.ts. A user can only see their own things, and gets a
+  // 404 (not a 403) for anyone else's, so ids cannot be probed for existence.
+
+  const auth = { adminToken: opts.admin?.token, sessionSecret: opts.wallet?.sessionSecret };
+  const who = (req: FastifyRequest) => authenticate(pool, req, auth);
+
   app.post("/accounts", async (req, reply) => {
+    requireOperator(await who(req));
     const body = accountBody.parse(req.body);
     return reply.status(201).send(await createAccount(pool, body));
   });
 
   app.get("/accounts/:id", async (req) => {
+    const caller = await who(req);
     const id = uuid.parse((req.params as { id: string }).id);
     const account = await getAccount(pool, id);
-    if (!account) throw new ApiError(404, "account_not_found", "Account not found.");
+    if (!account || !canSee(caller, id)) throw new ApiError(404, "account_not_found", "Account not found.");
     return account;
   });
 
   app.get("/accounts/:id/entries", async (req) => {
+    const caller = await who(req);
     const id = uuid.parse((req.params as { id: string }).id);
     const q = z
       .object({ limit: z.coerce.number().int().min(1).max(200).optional(), before: z.coerce.number().int().optional() })
       .parse(req.query);
-    if (!(await getAccount(pool, id))) throw new ApiError(404, "account_not_found", "Account not found.");
+    if (!canSee(caller, id) || !(await getAccount(pool, id))) throw new ApiError(404, "account_not_found", "Account not found.");
     return { data: await listEntries(pool, id, q) };
   });
 
   app.post("/transfers", async (req, reply) => {
-    const key = requireIdempotencyKey(req.headers["idempotency-key"]);
+    const caller = await who(req);
+    const key = scopeKey(caller, requireIdempotencyKey(req.headers["idempotency-key"]));
     const body = transferBody.parse(req.body);
+    requireOwnAccount(caller, body.from_account_id);
     const { transfer, replayed } = await createTransfer(pool, key, body, { scope: "api" });
 
     if (replayed) reply.header("Idempotent-Replayed", "true");
@@ -138,20 +151,25 @@ export function buildApp(
   });
 
   app.get("/transfers/:id", async (req) => {
+    const caller = await who(req);
     const id = uuid.parse((req.params as { id: string }).id);
     const transfer = await getTransfer(pool, id);
-    if (!transfer) throw new ApiError(404, "transfer_not_found", "Transfer not found.");
+    if (!transfer || !canSee(caller, transfer.from_account_id, transfer.to_account_id)) {
+      throw new ApiError(404, "transfer_not_found", "Transfer not found.");
+    }
     return serializeTransfer(transfer);
   });
 
   // ---- Deposits (Stripe Checkout, test mode) --------------------------------
 
   app.post("/deposits", async (req, reply) => {
+    const caller = await who(req);
     if (!payments.gateway) {
       throw new ApiError(503, "payments_not_configured", "Set STRIPE_SECRET_KEY (a test-mode key) to enable deposits.");
     }
-    const key = requireIdempotencyKey(req.headers["idempotency-key"]);
+    const key = scopeKey(caller, requireIdempotencyKey(req.headers["idempotency-key"]));
     const body = depositBody.parse(req.body);
+    requireOwnAccount(caller, body.account_id);
     const { deposit, replayed } = await createDeposit(pool, payments.gateway, key, body, payments.appBaseUrl);
     if (replayed) reply.header("Idempotent-Replayed", "true");
     return reply.status(201).send(serializeDeposit(deposit));
@@ -159,11 +177,18 @@ export function buildApp(
 
   // Also the Checkout success/cancel URL. Landing here credits nothing: the
   // status only changes when the verified webhook arrives, so a client should
-  // show "pending" until it does.
+  // show "pending" until it does. The browser Checkout sends back carries no
+  // credentials, so without an Authorization header this answers only the id
+  // and status (the id is a random UUID that only the payer and Stripe have);
+  // the full deposit needs the owner's or an operator's token.
   app.get("/deposits/:id", async (req) => {
     const id = uuid.parse((req.params as { id: string }).id);
+    const caller = hasCredentials(req) ? await who(req) : null;
     const deposit = await getDeposit(pool, id);
-    if (!deposit) throw new ApiError(404, "deposit_not_found", "Deposit not found.");
+    if (!deposit || (caller && !canSee(caller, deposit.account_id))) {
+      throw new ApiError(404, "deposit_not_found", "Deposit not found.");
+    }
+    if (!caller) return { id: deposit.id, status: deposit.status };
     return serializeDeposit(deposit);
   });
 
@@ -172,8 +197,10 @@ export function buildApp(
   // Holds the money and queues the payout for the bank, in one transaction.
   // No bank call happens here: the outbox worker sends it after commit.
   app.post("/payouts", async (req, reply) => {
-    const key = requireIdempotencyKey(req.headers["idempotency-key"]);
+    const caller = await who(req);
+    const key = scopeKey(caller, requireIdempotencyKey(req.headers["idempotency-key"]));
     const body = payoutBody.parse(req.body);
+    requireOwnAccount(caller, body.account_id);
     const { payout, replayed } = await createPayout(pool, key, body);
     if (replayed) reply.header("Idempotent-Replayed", "true");
     if (payout.status === "rejected") {
@@ -186,9 +213,10 @@ export function buildApp(
   });
 
   app.get("/payouts/:id", async (req) => {
+    const caller = await who(req);
     const id = uuid.parse((req.params as { id: string }).id);
     const payout = await getPayout(pool, id);
-    if (!payout) throw new ApiError(404, "payout_not_found", "Payout not found.");
+    if (!payout || !canSee(caller, payout.account_id)) throw new ApiError(404, "payout_not_found", "Payout not found.");
     return serializePayout(payout);
   });
 
