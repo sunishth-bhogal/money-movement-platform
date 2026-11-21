@@ -81,73 +81,83 @@ export async function createTransfer(
   idempotencyKey: string,
   req: TransferRequest,
 ): Promise<TransferResult> {
+  return withTransaction(pool, (client) => createTransferInTx(client, idempotencyKey, req));
+}
+
+/**
+ * The body of createTransfer, for callers that already hold a transaction and
+ * need the transfer to commit atomically with their own writes (e.g. a webhook
+ * that must record the event and post the deposit together).
+ */
+export async function createTransferInTx(
+  client: pg.PoolClient,
+  idempotencyKey: string,
+  req: TransferRequest,
+): Promise<TransferResult> {
   if (req.from_account_id === req.to_account_id) {
     throw new ApiError(400, "same_account", "from_account_id and to_account_id must differ.");
   }
   const requestHash = hashRequest(req);
+  // 1. Already processed?
+  const existing = await findByKey(client, idempotencyKey);
+  if (existing) return replay(existing, requestHash);
 
-  return withTransaction(pool, async (client) => {
-    // 1. Already processed?
-    const existing = await findByKey(client, idempotencyKey);
-    if (existing) return replay(existing, requestHash);
+  // 2. Lock both accounts in id order. FOR NO KEY UPDATE is the weakest row
+  //    lock that still serialises balance changes. Unlike FOR UPDATE it does
+  //    not block the FOR KEY SHARE locks that foreign-key checks take, so
+  //    other inserts that merely *reference* an account are not held up.
+  const { rows: accounts } = await client.query<{
+    id: string;
+    currency: string;
+    kind: "user" | "system";
+    balance_cents: number;
+  }>(
+    `SELECT id, currency, kind, balance_cents
+       FROM accounts
+      WHERE id = ANY($1::uuid[])
+      ORDER BY id
+        FOR NO KEY UPDATE`,
+    [[req.from_account_id, req.to_account_id]],
+  );
+  const from = accounts.find((a) => a.id === req.from_account_id);
+  const to = accounts.find((a) => a.id === req.to_account_id);
+  if (!from || !to) throw new ApiError(404, "account_not_found", "One or both accounts do not exist.");
+  if (from.currency !== req.currency || to.currency !== req.currency) {
+    throw new ApiError(422, "currency_mismatch", "Both accounts must hold the transfer currency.");
+  }
 
-    // 2. Lock both accounts in id order. FOR NO KEY UPDATE is the weakest row
-    //    lock that still serialises balance changes. Unlike FOR UPDATE it does
-    //    not block the FOR KEY SHARE locks that foreign-key checks take, so
-    //    other inserts that merely *reference* an account are not held up.
-    const { rows: accounts } = await client.query<{
-      id: string;
-      currency: string;
-      kind: "user" | "system";
-      balance_cents: number;
-    }>(
-      `SELECT id, currency, kind, balance_cents
-         FROM accounts
-        WHERE id = ANY($1::uuid[])
-        ORDER BY id
-          FOR NO KEY UPDATE`,
-      [[req.from_account_id, req.to_account_id]],
+  // 3. Funds check under lock. System accounts may go negative.
+  const insufficient = from.kind === "user" && from.balance_cents < req.amount_cents;
+  const status = insufficient ? "rejected" : "posted";
+  const failureReason = insufficient ? "insufficient_funds" : null;
+
+  // 4. Claim the idempotency key.
+  const { rows: inserted } = await client.query<TransferRow>(
+    `INSERT INTO transfers
+       (idempotency_key, request_hash, from_account_id, to_account_id, amount_cents, currency, status, failure_reason)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (idempotency_key) DO NOTHING
+     RETURNING ${TRANSFER_COLUMNS}`,
+    [idempotencyKey, requestHash, from.id, to.id, req.amount_cents, req.currency, status, failureReason],
+  );
+  if (inserted.length === 0) {
+    // A concurrent request with the same key committed first. We have
+    // written nothing yet; return its stored result.
+    const winner = await findByKey(client, idempotencyKey);
+    if (!winner) throw new Error("idempotency conflict but no row found");
+    return replay(winner, requestHash);
+  }
+  const transfer = inserted[0];
+
+  // 5. Double-entry posting.
+  if (status === "posted") {
+    await client.query(
+      `INSERT INTO ledger_entries (transfer_id, account_id, amount_cents, currency)
+       VALUES ($1, $2, $3, $5), ($1, $4, $6, $5)`,
+      [transfer.id, from.id, -req.amount_cents, to.id, req.currency, req.amount_cents],
     );
-    const from = accounts.find((a) => a.id === req.from_account_id);
-    const to = accounts.find((a) => a.id === req.to_account_id);
-    if (!from || !to) throw new ApiError(404, "account_not_found", "One or both accounts do not exist.");
-    if (from.currency !== req.currency || to.currency !== req.currency) {
-      throw new ApiError(422, "currency_mismatch", "Both accounts must hold the transfer currency.");
-    }
-
-    // 3. Funds check under lock. System accounts may go negative.
-    const insufficient = from.kind === "user" && from.balance_cents < req.amount_cents;
-    const status = insufficient ? "rejected" : "posted";
-    const failureReason = insufficient ? "insufficient_funds" : null;
-
-    // 4. Claim the idempotency key.
-    const { rows: inserted } = await client.query<TransferRow>(
-      `INSERT INTO transfers
-         (idempotency_key, request_hash, from_account_id, to_account_id, amount_cents, currency, status, failure_reason)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-       ON CONFLICT (idempotency_key) DO NOTHING
-       RETURNING ${TRANSFER_COLUMNS}`,
-      [idempotencyKey, requestHash, from.id, to.id, req.amount_cents, req.currency, status, failureReason],
-    );
-    if (inserted.length === 0) {
-      // A concurrent request with the same key committed first. We have
-      // written nothing yet; return its stored result.
-      const winner = await findByKey(client, idempotencyKey);
-      if (!winner) throw new Error("idempotency conflict but no row found");
-      return replay(winner, requestHash);
-    }
-    const transfer = inserted[0];
-
-    // 5. Double-entry posting.
-    if (status === "posted") {
-      await client.query(
-        `INSERT INTO ledger_entries (transfer_id, account_id, amount_cents, currency)
-         VALUES ($1, $2, $3, $5), ($1, $4, $6, $5)`,
-        [transfer.id, from.id, -req.amount_cents, to.id, req.currency, req.amount_cents],
-      );
-    }
-    return { transfer: toTransfer(transfer), replayed: false };
-  });
+  }
+  return { transfer: toTransfer(transfer), replayed: false };
 }
 
 export async function getTransfer(pool: pg.Pool, id: string): Promise<Transfer | undefined> {

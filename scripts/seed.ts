@@ -1,5 +1,6 @@
-// Creates a system "funding" account (stands in for Stripe until stage 1 is
-// built) and two users, and funds Alice with $50.00 through a normal transfer.
+// Creates a system "funding" account and two users, and funds Alice with $50.00
+// through a normal transfer, so transfers can be tried without Stripe. Real
+// deposits go through POST /deposits (Stripe Checkout, test mode).
 import { randomUUID } from "node:crypto";
 import { createPool } from "../src/db.js";
 import { migrate } from "../src/migrate.js";
