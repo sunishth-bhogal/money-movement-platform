@@ -128,8 +128,8 @@ export async function createDeposit(
   try {
     session = await gateway.createCheckoutSession(
       {
-        depositId: row.id,
-        amountCents: row.amount_cents,
+        reference: { type: "deposit", id: row.id },
+        lineItems: [{ name: "Account deposit (test mode)", unitAmountCents: row.amount_cents, quantity: 1 }],
         currency: row.currency,
         successUrl: returnUrl
           ? `${returnUrl}?deposit=${row.id}&checkout=success`

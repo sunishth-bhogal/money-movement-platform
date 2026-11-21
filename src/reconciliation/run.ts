@@ -29,7 +29,7 @@ export type ItemOutcome = "open" | "auto_resolved" | "in_transit" | "acknowledge
 
 export interface ReconItem extends Disagreement {
   break_key: string;
-  object_type: "payout" | "deposit";
+  object_type: "payout" | "deposit" | "order";
   object_id: string | null;
   account_id: string | null;
   provider_ref: string | null;

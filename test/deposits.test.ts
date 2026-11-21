@@ -3,7 +3,7 @@ import Stripe from "stripe";
 import { afterAll, beforeEach, describe, expect, it } from "vitest";
 import { buildApp } from "../src/app.js";
 import { checkLedgerInvariants, createAccount } from "../src/ledger/accounts.js";
-import type { CheckoutGateway } from "../src/payments/stripe.js";
+import type { CheckoutGateway, CheckoutSessionInput } from "../src/payments/stripe.js";
 import { AS_OPERATOR, balanceOf, operatorAuth, pool } from "./helpers.js";
 
 // A made-up signing secret. Signatures are computed with Stripe's own SDK, so
@@ -14,8 +14,8 @@ const WEBHOOK_SECRET = "whsec_test_" + randomUUID().replaceAll("-", "");
 class FakeGateway implements CheckoutGateway {
   calls: { depositId: string; idempotencyKey: string }[] = [];
   failNext = 0;
-  async createCheckoutSession(input: { depositId: string }, idempotencyKey: string) {
-    this.calls.push({ depositId: input.depositId, idempotencyKey });
+  async createCheckoutSession(input: CheckoutSessionInput, idempotencyKey: string) {
+    this.calls.push({ depositId: input.reference.id, idempotencyKey });
     if (this.failNext > 0) {
       this.failNext--;
       throw new Error("simulated network error");

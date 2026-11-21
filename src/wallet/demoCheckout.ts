@@ -26,7 +26,13 @@ export function demoCheckoutGateway(appBaseUrl: string): CheckoutGateway {
     async createCheckoutSession(input, idempotencyKey) {
       // Deterministic per idempotency key, like Stripe's idempotency: a retry gets the same session.
       const id = DEMO_SESSION_PREFIX + Buffer.from(idempotencyKey).toString("hex").slice(-48);
-      return { id, url: `${appBaseUrl}/wallet/?demo_checkout=${encodeURIComponent(input.depositId)}` };
+      const { type, id: ref } = input.reference;
+      // Deposits are paid on the wallet's demo page, ticket orders on the portal's box office.
+      const url =
+        type === "order"
+          ? `${appBaseUrl}/portal/?demo_checkout_order=${encodeURIComponent(ref)}`
+          : `${appBaseUrl}/wallet/?demo_checkout=${encodeURIComponent(ref)}`;
+      return { id, url };
     },
   };
 }

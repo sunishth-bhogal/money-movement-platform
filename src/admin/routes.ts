@@ -15,7 +15,7 @@ import {
   stuckPayouts,
   traceBreakKey,
 } from "../reconciliation/queries.js";
-import { acknowledgeFlag, listResolutions, resolveItem } from "../reconciliation/resolve.js";
+import { acknowledgeFlag, listResolutions, RESOLUTION_CAUSES, resolveItem } from "../reconciliation/resolve.js";
 import { getRun, listRuns, runReconciliation, type ReconProviders } from "../reconciliation/run.js";
 
 export interface AdminOptions {
@@ -33,6 +33,8 @@ const runBody = z.object({ source: z.enum(RECON_SOURCES as [string, ...string[]]
 const resolveBody = z.object({
   action: z.enum(["accept_provider", "accept_ours"]),
   counterparty: z.enum(["user", "platform"]).optional(),
+  // Required: a correction must say why the books were wrong, not only what to do.
+  cause: z.enum(RESOLUTION_CAUSES),
   note,
   resolved_by: who,
 });

@@ -7,6 +7,7 @@ import { ApiError } from "../errors.js";
 import { recordEventOnce } from "../ledger/events.js";
 import { createTransferInTx } from "../ledger/transfers.js";
 import { enqueueOutboxEvent } from "../outbox/outbox.js";
+import { recordOrganizerPosting } from "../organizers/postings.js";
 
 export type PayoutStatus = "rejected" | "pending" | "submitted" | "succeeded" | "failed" | "returned";
 
@@ -25,6 +26,10 @@ export interface Payout {
   reverse_transfer_id: string | null;
   return_transfer_id: string | null;
   discrepancy: string | null;
+  /** Set for a payout to an event organizer; account_id is then their available balance. */
+  organizer_id: string | null;
+  /** The event whose release (or advance) created this payout, if any. */
+  event_id: string | null;
   created_at: Date;
   updated_at: Date;
 }
@@ -45,7 +50,7 @@ export const BANK_PROVIDER = "mock_bank";
 const PAYOUT_COLUMNS =
   "id, idempotency_key, request_hash, account_id, amount_cents, currency, bank_account_number, status, " +
   "provider_payout_id, failure_reason, hold_transfer_id, settle_transfer_id, reverse_transfer_id, " +
-  "return_transfer_id, discrepancy, created_at, updated_at";
+  "return_transfer_id, discrepancy, organizer_id, event_id, created_at, updated_at";
 
 type PayoutRow = Payout & { request_hash: string };
 
@@ -125,6 +130,30 @@ export async function createPayout(
   idempotencyKey: string,
   req: PayoutRequest,
 ): Promise<{ payout: Payout; replayed: boolean }> {
+  return withTransaction(pool, (client) => createPayoutInTx(client, idempotencyKey, req));
+}
+
+/** For a payout to an organizer: whose, and why (shown on their statement). */
+export interface OrganizerPayoutContext {
+  organizerId: string;
+  eventId?: string | null;
+  memo: string;
+}
+
+/**
+ * The body of createPayout, for callers that already hold a transaction (the
+ * organizer payout schedule releases an event's money and pays it out in one).
+ *
+ * With `organizer`, the account must be that organizer's available balance,
+ * which may be negative for other reasons, so the hold is made with
+ * requireFunds: a payout never takes it below zero.
+ */
+export async function createPayoutInTx(
+  client: pg.PoolClient,
+  idempotencyKey: string,
+  req: PayoutRequest,
+  organizer?: OrganizerPayoutContext,
+): Promise<{ payout: Payout; replayed: boolean }> {
   const requestHash = hashPayoutRequest(req);
   const replay = (row: PayoutRow) => {
     if (row.request_hash !== requestHash) {
@@ -133,68 +162,83 @@ export async function createPayout(
     return { payout: toPayout(row), replayed: true };
   };
 
-  return withTransaction(pool, async (client) => {
-    const { rows: existing } = await client.query<PayoutRow>(
-      `SELECT ${PAYOUT_COLUMNS} FROM payouts WHERE idempotency_key = $1`,
-      [idempotencyKey],
-    );
-    if (existing[0]) return replay(existing[0]);
+  const { rows: existing } = await client.query<PayoutRow>(
+    `SELECT ${PAYOUT_COLUMNS} FROM payouts WHERE idempotency_key = $1`,
+    [idempotencyKey],
+  );
+  if (existing[0]) return replay(existing[0]);
 
-    const { rows: accounts } = await client.query<{ kind: string; currency: string }>(
-      "SELECT kind, currency FROM accounts WHERE id = $1",
-      [req.account_id],
-    );
-    const account = accounts[0];
-    if (!account || account.kind !== "user") throw new ApiError(404, "account_not_found", "Account not found.");
-    if (account.currency !== req.currency) {
-      throw new ApiError(422, "currency_mismatch", "The account does not hold this currency.");
-    }
+  const { rows: accounts } = await client.query<{ kind: string; currency: string }>(
+    "SELECT kind, currency FROM accounts WHERE id = $1",
+    [req.account_id],
+  );
+  const account = accounts[0];
+  if (!account || account.kind !== (organizer ? "organizer" : "user")) {
+    throw new ApiError(404, "account_not_found", "Account not found.");
+  }
+  if (account.currency !== req.currency) {
+    throw new ApiError(422, "currency_mismatch", "The account does not hold this currency.");
+  }
 
-    const { rows: inserted } = await client.query<PayoutRow>(
-      `INSERT INTO payouts (idempotency_key, request_hash, account_id, amount_cents, currency, bank_account_number)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       ON CONFLICT (idempotency_key) DO NOTHING
-       RETURNING ${PAYOUT_COLUMNS}`,
-      [idempotencyKey, requestHash, req.account_id, req.amount_cents, req.currency, req.bank_account_number],
-    );
-    if (!inserted[0]) {
-      // A concurrent request with this key committed first.
-      const { rows } = await client.query<PayoutRow>(`SELECT ${PAYOUT_COLUMNS} FROM payouts WHERE idempotency_key = $1`, [
-        idempotencyKey,
-      ]);
-      return replay(rows[0]);
-    }
-    const payout = inserted[0];
+  const { rows: inserted } = await client.query<PayoutRow>(
+    `INSERT INTO payouts (idempotency_key, request_hash, account_id, amount_cents, currency, bank_account_number, organizer_id, event_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+     ON CONFLICT (idempotency_key) DO NOTHING
+     RETURNING ${PAYOUT_COLUMNS}`,
+    [
+      idempotencyKey,
+      requestHash,
+      req.account_id,
+      req.amount_cents,
+      req.currency,
+      req.bank_account_number,
+      organizer?.organizerId ?? null,
+      organizer?.eventId ?? null,
+    ],
+  );
+  if (!inserted[0]) {
+    // A concurrent request with this key committed first.
+    const { rows } = await client.query<PayoutRow>(`SELECT ${PAYOUT_COLUMNS} FROM payouts WHERE idempotency_key = $1`, [
+      idempotencyKey,
+    ]);
+    return replay(rows[0]);
+  }
+  const payout = inserted[0];
 
-    const { transfer: hold } = await createTransferInTx(
-      client,
-      `payout:${payout.id}:hold`,
-      {
-        from_account_id: payout.account_id,
-        to_account_id: await inFlightAccount(client, payout.currency),
-        amount_cents: payout.amount_cents,
-        currency: payout.currency,
-      },
-      { scope: "system" },
-    );
-    const status: PayoutStatus = hold.status === "posted" ? "pending" : "rejected";
-    const { rows } = await client.query<PayoutRow>(
-      `UPDATE payouts SET status = $2, hold_transfer_id = $3, failure_reason = $4, updated_at = now()
-        WHERE id = $1 RETURNING ${PAYOUT_COLUMNS}`,
-      [payout.id, status, hold.id, hold.failure_reason],
-    );
-    const result = toPayout(rows[0]);
-    await enqueuePayoutEvent(client, result);
-    if (status === "pending") {
-      await enqueueOutboxEvent(client, {
-        eventType: PAYOUT_SUBMIT_EVENT,
-        aggregateType: "payout",
-        aggregateId: result.id,
-        payload: { payout_id: result.id },
-      });
-    }
-    return { payout: result, replayed: false };
-  });
+  const { transfer: hold } = await createTransferInTx(
+    client,
+    `payout:${payout.id}:hold`,
+    {
+      from_account_id: payout.account_id,
+      to_account_id: await inFlightAccount(client, payout.currency),
+      amount_cents: payout.amount_cents,
+      currency: payout.currency,
+    },
+    { scope: "system", requireFunds: true },
+  );
+  if (organizer && hold.status === "posted") {
+    await recordOrganizerPosting(client, hold.id, organizer.organizerId, "payout", organizer.memo, {
+      payoutId: payout.id,
+      eventId: organizer.eventId,
+    });
+  }
+  const status: PayoutStatus = hold.status === "posted" ? "pending" : "rejected";
+  const { rows } = await client.query<PayoutRow>(
+    `UPDATE payouts SET status = $2, hold_transfer_id = $3, failure_reason = $4, updated_at = now()
+      WHERE id = $1 RETURNING ${PAYOUT_COLUMNS}`,
+    [payout.id, status, hold.id, hold.failure_reason],
+  );
+  const result = toPayout(rows[0]);
+  await enqueuePayoutEvent(client, result);
+  if (status === "pending") {
+    await enqueueOutboxEvent(client, {
+      eventType: PAYOUT_SUBMIT_EVENT,
+      aggregateType: "payout",
+      aggregateId: result.id,
+      payload: { payout_id: result.id },
+    });
+  }
+  return { payout: result, replayed: false };
 }
 
 export type ProviderUpdateOutcome =
@@ -285,6 +329,18 @@ export async function applyProviderState(
       { from_account_id: from, to_account_id: to, amount_cents: payout.amount_cents, currency: payout.currency },
       { scope: "system" },
     );
+    // Money coming back to an organizer goes on their statement, with the bank's reason.
+    if (payout.organizer_id && step !== "settle") {
+      const why = bank.failure_code ? ` (${bank.failure_code})` : "";
+      await recordOrganizerPosting(
+        client,
+        transfer.id,
+        payout.organizer_id,
+        step === "reverse" ? "payout_failed" : "payout_returned",
+        step === "reverse" ? `The bank did not pay out this payout${why}; the money is back in your balance` : `The receiving bank sent this payout back${why}; the money is back in your balance`,
+        { payoutId: payout.id, eventId: payout.event_id },
+      );
+    }
     return transfer.id;
   };
 

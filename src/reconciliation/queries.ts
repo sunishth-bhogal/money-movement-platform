@@ -36,7 +36,7 @@ export async function listBreaks(pool: pg.Pool, { includeResolved = false } = {}
      )
      SELECT i.*, l.source,
             CASE WHEN r.id IS NULL THEN NULL ELSE json_build_object(
-              'id', r.id, 'action', r.action, 'counterparty', r.counterparty, 'note', r.note,
+              'id', r.id, 'action', r.action, 'counterparty', r.counterparty, 'cause', r.cause, 'note', r.note,
               'resolved_by', r.resolved_by, 'created_at', r.created_at) END AS resolution
        FROM reconciliation_items i
        JOIN latest l ON l.id = i.run_id
