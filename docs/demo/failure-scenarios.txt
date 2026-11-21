@@ -1,0 +1,71 @@
+Money movement platform: three ways money gets moved twice, or lost, and why it doesn't here
+API http://localhost:3000 · mock bank http://localhost:4000 · run 1795299277
+
+━━ 1. The same transfer, sent twice at the same moment 
+A double-click, or a phone retrying after a timeout: two identical requests
+arrive together. Both carry the same Idempotency-Key, because the client
+made one key for one intention.
+Alice has $366.48.
+$ POST /me/transfers  Idempotency-Key: demo-1795299277-transfer  {to: Bob, amount: $12.34}   ×2, in parallel
+  → replayed  transfer eedb46bc-694e-4378-bdd9-44c21c4a22e8  Completed
+  → created   transfer eedb46bc-694e-4378-bdd9-44c21c4a22e8  Completed
+  ✓ both responses name the same transfer (1)
+  ✓ one of them was answered from the first (1)
+  ✓ one posting on Alice's ledger statement (1)
+  ✓ Alice's balance went down once, by 1234 cents (1234)
+Why: the transfer row is the idempotency record, in the same transaction as the
+ledger entries. A unique index on (scope, key) makes the second request wait for
+the first, see the conflict, and return the stored transfer.
+
+━━ 2. The same webhook, delivered more than once 
+Providers deliver at least once: any timeout on their side means a resend.
+First Stripe (through the demo checkout, which signs real Stripe events and
+posts them to /webhooks/stripe), then the bank.
+$ POST /me/deposits  {amount: $25.00}                       as Bob
+  → deposit cce34c01-b093-4c5d-9b17-5bd985efeb6b: Waiting for payment
+$ POST /me/deposits/cce34c01-b093-4c5d-9b17-5bd985efeb6b/demo-checkout  {outcome: pay_duplicate_webhook}
+  → webhook delivery: HTTP 200 deposit_succeeded
+  → webhook delivery: HTTP 200 duplicate
+  ✓ one credit on Bob's statement (1)
+  ✓ Bob's balance went up once, by 2500 cents (2500)
+
+Now the bank sends every webhook three times.
+$ POST http://localhost:4000/_admin/behaviour  {webhookCopies: 3}
+$ POST /me/payouts  {amount: $9.00, to account ••1111}       as Alice
+  → payout c5b6fcfb-3183-4a53-afff-789aef159bd5 is pending, money on hold. Waiting for the bank to pay it out...
+  ✓ the payout settled
+  → the bank delivered evt_f05c7f83792d40139f36d0e9 3 times, and our endpoint answered 200 to each
+  ✓ three deliveries of the same event (3)
+  ✓ one settle transfer in the ledger (1)
+Why: processed_events has a primary key of (provider, event_id), and the insert
+is in the same transaction as the event's effects. The copies are acknowledged
+with 200 and skipped. If applying an event crashes, its record rolls back too,
+so the provider's next resend is processed rather than lost.
+
+━━ 3. The bank's response is lost, and no webhook ever comes 
+The worker sends the payout. The bank creates it, and the response never
+reaches us. Then the bank goes quiet: no webhook. Nobody tells us it was paid.
+$ POST http://localhost:4000/_admin/behaviour  {loseResponses: 1, webhooksEnabled: false}
+$ POST /me/payouts  {amount: $7.00, to account ••1111}       as Alice
+  → payout 010e7307-4578-45f8-8f0b-6b8c99f8afdc, money on hold. Waiting for the bank to pay it out on its side...
+  → the bank says: succeeded
+  → we say:       pending (submitted)
+  ✓ the bank paid it out (succeeded)
+  ✓ our side still thinks it is pending: nobody told us (pending)
+$ POST /admin/reconciliation/runs  {source: mock_bank, currency: USD}
+  → run completed: 12 bank records, 11 matched, 1 auto-resolved, 0 open breaks
+  → held money: ledger 0 − bank 0 = explained by open items 0, unattributed 0: ties out
+  → settled money: ledger 12400 − bank 12400 = explained by open items 0, unattributed 0: ties out
+  → this payout: status_mismatch → auto_resolved (applied bank status succeeded (succeeded))
+  ✓ the run settled our payout (settled)
+  ✓ with one settle transfer (1)
+  ✓ and the bank holds one payout for it: it was never sent twice (1)
+  ✓ the run's proof ties out to the cent (true)
+$ POST /admin/reconciliation/runs  (again)
+  ✓ a second run finds nothing left to fix (0)
+Why: the run compares books with books, the bank's statement against the money
+the ledger's control accounts attribute to each payout. Ours still open, the
+bank's final: it applies the bank's word through the same function a webhook
+uses, so it can only move money forward, once. Silence is never read as failure.
+
+All three scenarios behaved: no money moved twice, none was lost.

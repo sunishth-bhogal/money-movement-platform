@@ -17,6 +17,11 @@ money and accounts are fictional, and Stripe is only ever used in test mode.
 
 **Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Stripe (test mode), React + Vite (wallet and admin dashboard), Vitest, Docker.
 
+**Start here:** [architecture diagrams](docs/ARCHITECTURE.md) ·
+[failure-scenario demo](docs/demo/README.md) (duplicate transfer, duplicate
+webhook, lost bank response, as a recording and a script) ·
+[interview talking points](docs/INTERVIEW.md).
+
 ## One-command demo
 
 ```bash
