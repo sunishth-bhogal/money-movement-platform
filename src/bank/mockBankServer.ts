@@ -25,6 +25,18 @@ const payoutBody = z.object({
   account_number: z.string().regex(/^\d{4,17}$/),
 });
 
+const listQuery = z.object({
+  idempotency_key: z.string().min(1).optional(),
+  limit: z.coerce.number().int().min(1).max(500).optional(),
+  starting_after: z.string().min(1).optional(),
+});
+
+const tamperBody = z.object({
+  idempotency_key: z.string().min(1),
+  status: z.enum(["processing", "succeeded", "failed", "returned"]).optional(),
+  amount_cents: z.number().int().positive().optional(),
+});
+
 const behaviourBody = z
   .object({
     outage: z.boolean(),
@@ -71,10 +83,13 @@ export function buildMockBankServer(bank: MockBank): FastifyInstance {
     }
   });
 
+  // With ?idempotency_key=: one payout (404 if unknown). Without: the
+  // statement, paginated with ?limit= and ?starting_after=<bank payout id>.
   app.get("/payouts", async (req, reply) => {
-    const key = (req.query as { idempotency_key?: string }).idempotency_key;
-    if (!key) return reply.status(400).send({ error: { code: "idempotency_key_required" } });
+    const q = listQuery.parse(req.query);
+    const key = q.idempotency_key;
     try {
+      if (!key) return await bank.listPayouts({ limit: q.limit, starting_after: q.starting_after });
       const payout = await bank.getPayoutByKey(key);
       return payout ? payout : reply.status(404).send({ error: { code: "not_found" } });
     } catch (err) {
@@ -93,6 +108,15 @@ export function buildMockBankServer(bank: MockBank): FastifyInstance {
   app.post("/_admin/behaviour", async (req) => {
     Object.assign(bank.behaviour, behaviourBody.parse(req.body));
     return bank.behaviour;
+  });
+
+  // Make the bank change its story about a payout, for reconciliation demos.
+  app.post("/_admin/tamper", async (req, reply) => {
+    const body = tamperBody.parse(req.body);
+    const { idempotency_key, ...change } = body;
+    if (!bank.knows(idempotency_key)) return reply.status(404).send({ error: { code: "not_found" } });
+    bank.tamper(idempotency_key, change);
+    return bank.getPayoutByKey(idempotency_key);
   });
 
   app.post("/_admin/process", async () => {

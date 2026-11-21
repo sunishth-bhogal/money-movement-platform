@@ -9,6 +9,7 @@ import { verifyStripeEvent, type PaymentsConfig } from "./payments/stripe.js";
 import type { BankWebhookEvent } from "./bank/mockBank.js";
 import { BANK_SIGNATURE_HEADER, verifyBankWebhook } from "./bank/signature.js";
 import { createPayout, getPayout, handleBankWebhook, type Payout } from "./payouts/payouts.js";
+import { registerAdminRoutes, type AdminOptions } from "./admin/routes.js";
 
 const uuid = z.string().uuid();
 const currency = z.string().regex(/^[A-Z]{3}$/, "ISO 4217 code, e.g. USD");
@@ -68,6 +69,8 @@ export function buildApp(
     payments?: PaymentsConfig;
     /** Shared secret for bank webhook signatures. Unset: POST /webhooks/bank returns 503. */
     bankWebhookSecret?: string;
+    /** The reconciliation admin API (/admin). Without a token it answers 503. */
+    admin?: AdminOptions;
   } = {},
 ): FastifyInstance {
   const payments: PaymentsConfig = opts.payments ?? { appBaseUrl: "http://localhost:3000" };
@@ -240,6 +243,8 @@ export function buildApp(
       return reply.status(200).send({ received: true, ...result });
     });
   });
+
+  registerAdminRoutes(app, pool, opts.admin ?? { providers: {} });
 
   return app;
 }

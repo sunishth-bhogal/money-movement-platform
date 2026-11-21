@@ -26,6 +26,10 @@ services:
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:3000}
       BANK_WEBHOOK_SECRET: ${BANK_WEBHOOK_SECRET:-local_mock_bank_secret}
+      # Reconciliation reads the bank's statement from here.
+      BANK_API_URL: http://mock-bank:4000
+      # The admin API and dashboard (http://localhost:3000/dashboard/). Change it for anything but local demos.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-local-admin-token}
     ports:
       - "3000:3000"
     depends_on:

@@ -4,6 +4,7 @@ import {
   BankRejectedError,
   BankUnavailableError,
   type BankClient,
+  type BankListPage,
   type BankPayout,
   type BankPayoutRequest,
   type BankPayoutStatus,
@@ -151,6 +152,14 @@ export class MockBank implements BankClient {
     return stored ? { ...stored.payout } : null;
   }
 
+  async listPayouts(page: BankListPage, signal?: AbortSignal): Promise<{ data: BankPayout[]; has_more: boolean }> {
+    await this.enter(signal);
+    const all = [...this.byKey.values()].map((s) => s.payout);
+    const start = page.starting_after ? all.findIndex((p) => p.id === page.starting_after) + 1 : 0;
+    const limit = page.limit ?? 100;
+    return { data: all.slice(start, start + limit).map((p) => ({ ...p })), has_more: start + limit < all.length };
+  }
+
   private async enter(signal?: AbortSignal) {
     if (this.behaviour.latencyMs > 0) await sleep(this.behaviour.latencyMs, signal);
     if (this.behaviour.outage) throw new BankUnavailableError("bank answered HTTP 503");
@@ -222,6 +231,26 @@ export class MockBank implements BankClient {
     const s = this.byKey.get(key);
     if (!s) throw new Error(`no payout for key ${key}`);
     Object.assign(s.payout, change);
+  }
+
+  /** Put a payout on the bank's books that we never asked for (a bank error, or fraud). */
+  inject(payout: Omit<BankPayout, "id" | "created_at"> & { id?: string }): BankPayout {
+    const stored: StoredPayout = {
+      fingerprint: "injected",
+      settleAt: this.now(),
+      payout: {
+        ...payout,
+        id: payout.id ?? `po_${randomUUID().replaceAll("-", "").slice(0, 24)}`,
+        created_at: new Date(this.now()).toISOString(),
+      },
+    };
+    this.byKey.set(payout.idempotency_key, stored);
+    return { ...stored.payout };
+  }
+
+  /** The bank loses its record of a payout (e.g. a restart of the in-memory mock). */
+  forget(key: string): void {
+    this.byKey.delete(key);
   }
 
   knows(key: string): boolean {

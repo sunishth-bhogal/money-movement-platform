@@ -10,6 +10,9 @@ import { migrate } from "../migrate.js";
 import { PAYOUT_SUBMIT_EVENT } from "../payouts/payouts.js";
 import { reconcilePayouts } from "../payouts/reconcile.js";
 import { payoutSubmitter } from "../payouts/submitter.js";
+import { loadPaymentsConfig } from "../payments/stripe.js";
+import { runReconciliation } from "../reconciliation/run.js";
+import { ApiError } from "../errors.js";
 import { httpPublisher, logPublisher, routingPublisher } from "./publishers.js";
 import { OutboxWorker, type Publisher } from "./worker.js";
 
@@ -49,9 +52,31 @@ const reconciler = bank
     }, reconcileEveryMs)
   : undefined;
 
+// Full reconciliation against each provider's statement. Copies take turns:
+// a run holds an advisory lock, and a copy that finds one running skips.
+const stripeRecords = loadPaymentsConfig().records;
+const fullEveryMs = Number(process.env.RECONCILE_EVERY_MS ?? 300_000);
+const currencies = (process.env.RECONCILE_CURRENCIES ?? "USD").split(",").map((c) => c.trim().toUpperCase());
+const fullRuns =
+  fullEveryMs > 0 && (bank || stripeRecords)
+    ? setInterval(async () => {
+        for (const currency of currencies) {
+          for (const source of [bank && "mock_bank", stripeRecords && "stripe"].filter(Boolean) as ("mock_bank" | "stripe")[]) {
+            try {
+              const r = await runReconciliation(pool, source, currency, { bank, stripe: stripeRecords });
+              console.log(`reconciliation ${source} ${currency}: ${r.status}`, r.status === "completed" ? `open=${r.open_breaks} auto=${r.auto_resolved}` : r.error);
+            } catch (err) {
+              if (!(err instanceof ApiError && err.code === "run_in_progress")) console.error(`reconciliation ${source} ${currency} failed:`, err);
+            }
+          }
+        }
+      }, fullEveryMs)
+    : undefined;
+
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
     clearInterval(reconciler);
+    clearInterval(fullRuns);
     // Let the in-flight batch settle so its rows aren't left waiting for a lease to expire.
     await worker.stop();
     await pool.end();
