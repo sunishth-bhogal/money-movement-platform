@@ -31,3 +31,31 @@ jobs:
       - run: npm run dashboard:build
       - run: npm run wallet:build
       - run: npm test
+
+  # Boots the one-command demo exactly as the README says, and smoke-tests it
+  # over HTTP: the seed, the worker, the mock bank, auth, and reconciliation.
+  compose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: docker compose up --build
+        run: docker compose up --build -d --wait db api mock-bank worker
+      - name: Seed the demo
+        run: docker compose run --rm seed
+      - name: Seeding again changes nothing
+        run: |
+          out=$(docker compose run --rm seed)
+          echo "$out"
+          # Every seeded action line must be answered from the first run.
+          if echo "$out" | grep '→' | grep -v 'replayed: already seeded'; then
+            echo "A second seed run did something new"; exit 1
+          fi
+      - name: Smoke test
+        run: docker compose run --rm seed npx tsx scripts/compose-smoke.ts
+      - name: Logs
+        if: always()
+        run: docker compose logs --no-color
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
