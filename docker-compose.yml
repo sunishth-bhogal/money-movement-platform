@@ -25,6 +25,7 @@ services:
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:3000}
+      BANK_WEBHOOK_SECRET: ${BANK_WEBHOOK_SECRET:-local_mock_bank_secret}
     ports:
       - "3000:3000"
     depends_on:
@@ -40,9 +41,23 @@ services:
       DATABASE_URL: postgres://postgres:postgres@db:5432/money_dev
       # Where to POST events. Unset: events are written to the worker's stdout.
       OUTBOX_WEBHOOK_URL: ${OUTBOX_WEBHOOK_URL:-}
+      # Sends payouts to the mock bank and reconciles quiet ones.
+      BANK_API_URL: http://mock-bank:4000
     depends_on:
       db:
         condition: service_healthy
+
+  # A fake external bank: its own state, delayed settlement, webhooks back to
+  # the API. Make it misbehave through POST localhost:4000/_admin/behaviour.
+  mock-bank:
+    build: .
+    command: ["npx", "tsx", "src/bank/run.ts"]
+    environment:
+      BANK_PORT: 4000
+      BANK_WEBHOOK_URL: http://api:3000/webhooks/bank
+      BANK_WEBHOOK_SECRET: ${BANK_WEBHOOK_SECRET:-local_mock_bank_secret}
+    ports:
+      - "4000:4000"
 
 volumes:
   pgdata:

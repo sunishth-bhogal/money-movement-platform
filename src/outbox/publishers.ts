@@ -57,3 +57,17 @@ export function logPublisher(write: (line: string) => void = (l) => console.log(
     },
   };
 }
+
+/**
+ * Sends each event to the publisher registered for its type, and everything
+ * else to `fallback`. This is how one outbox carries both announcements
+ * ("transfer.posted", for downstream consumers) and commands to providers
+ * ("payout.submit", for the bank connector), with the same retry machinery.
+ */
+export function routingPublisher(routes: Record<string, Publisher>, fallback: Publisher): Publisher {
+  return {
+    publish(event, signal) {
+      return (routes[event.event_type] ?? fallback).publish(event, signal);
+    },
+  };
+}
