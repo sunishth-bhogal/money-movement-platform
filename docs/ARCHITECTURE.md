@@ -8,9 +8,11 @@ any time. The diagrams render on GitHub (Mermaid).
 
 ```mermaid
 flowchart TB
+    P["Organizer portal and box office (React)"] -->|"Idempotency-Key"| EV
     W["Wallet (React)"] & C["API clients"] -->|"Idempotency-Key"| M
     D["Admin dashboard (React)"] --> AD
 
+    EV["API: ticketing<br/>orders · refunds · cancellations · advances · statements"]
     M["API: money routes<br/>transfers · deposits · payouts"]
     WH["API: webhooks<br/>Stripe · bank, signature checked"]
     AD["API: admin<br/>reconciliation · resolutions"]
@@ -18,11 +20,13 @@ flowchart TB
     PG[("PostgreSQL 16, the source of truth<br/>append-only balanced ledger · deposit and payout state machines<br/>processed_events inbox · outbox · reconciliation evidence")]
 
     M ==>|"one transaction:<br/>ledger + state + outbox row"| PG
+    EV ==>|"one transaction:<br/>ledger + organizer_postings + outbox row"| PG
     WH ==>|"one transaction:<br/>processed_events + effects + outbox row"| PG
     AD ==>|"runs, proofs, decisions<br/>as new ledger transfers"| PG
 
     PG -->|"claim due rows<br/>SKIP LOCKED · lease · claim_token"| WK["Outbox worker (run any number)<br/>retries with backoff · dead-letters<br/>payout status checks · scheduled reconciliation"]
 
+    WK -->|"refund.submit<br/>key refund:&lt;id&gt;"| STRIPE
     WK -->|"payout.submit<br/>key payout:&lt;id&gt;"| BANK["Mock bank<br/>slow · fails · loses responses<br/>duplicate or no webhooks"]
     WK -->|"transfer.posted, deposit.*<br/>stable event_id"| DS["Downstream consumers"]
     M -->|"open Checkout<br/>key deposit-checkout:&lt;id&gt;"| STRIPE["Stripe (test mode)"]
@@ -31,7 +35,10 @@ flowchart TB
 ```
 
 Reconciliation (from the admin API or on the worker's schedule) also reads each
-provider's whole statement: the bank's payouts and Stripe's Checkout Sessions.
+provider's whole statement: the bank's payouts and Stripe's Checkout Sessions
+(deposits and ticket orders). The worker also runs the payout schedule: it
+releases each event's held proceeds after the event and pays every organizer
+through the same payout path as a wallet withdrawal.
 
 What each process is allowed to do:
 
@@ -51,7 +58,8 @@ These are not conventions in application code; a bug cannot break them.
 | Every transfer balances | Deferred constraint trigger: entries per transfer sum to zero at `COMMIT` |
 | History is never rewritten | Triggers reject `UPDATE`, `DELETE`, `TRUNCATE` on `ledger_entries` and on the reconciliation evidence tables |
 | A balance is the sum of its entries | `balance_cents` is written only by the ledger insert trigger |
-| Users cannot overdraw | `CHECK (kind = 'system' OR balance_cents >= 0)` |
+| Users cannot overdraw; held proceeds never go negative | `CHECK (kind IN ('system', 'organizer') OR balance_cents >= 0)`: only an organizer's *available* balance may go negative (they owe it) |
+| Every organizer entry says why | Deferred constraint trigger: an entry on an organizer account needs an `organizer_postings` row for its transfer |
 | One operation per idempotency key | `UNIQUE (idempotency_scope, idempotency_key)` on `transfers` |
 | One effect per webhook | `PRIMARY KEY (provider, event_id)` on `processed_events` |
 | Held money goes one way | `CHECK (settle_transfer_id IS NULL OR reverse_transfer_id IS NULL)` on `payouts` |
@@ -71,6 +79,22 @@ flowchart LR
     PIF -- "payout:&lt;id&gt;:reverse<br/>bank failed it" --> U
     BP -- "payout:&lt;id&gt;:return<br/>bank sent it back" --> U
     RA["Reconciliation adjustments<br/>(platform's loss / gain)"] <-. "recon:&lt;resolution&gt;:&lt;n&gt;<br/>a person's decision" .-> U & PIF & BP
+```
+
+## Where an organizer's money sits
+
+```mermaid
+flowchart LR
+    SC["Stripe clearing"] -- "order:&lt;id&gt;:sale:&lt;org&gt;<br/>on verified webhook" --> H["Organizer held<br/>(never negative)"]
+    H -- "order:&lt;id&gt;:fee:&lt;org&gt;" --> PF["Platform fees"]
+    H -- "refund:&lt;id&gt;:&lt;org&gt;:held" --> RIF["Refunds in flight"]
+    A -- "refund:&lt;id&gt;:&lt;org&gt;:available" --> RIF
+    RIF -- "refund:&lt;id&gt;:settle<br/>Stripe confirmed" --> SR["Refunded through Stripe"]
+    H -- "event:&lt;id&gt;:release:&lt;org&gt;<br/>after the event<br/>(or :advance, before it)" --> A["Organizer available<br/>(negative = they owe us)"]
+    A -- "payout:&lt;id&gt;:hold" --> PIF["Payouts in flight"]
+    PIF -- "settle" --> BP["Bank payouts"]
+    H & A -- "dispute:&lt;id&gt;:..." --> SD["Stripe disputes"]
+    OA["Organizer adjustments"] <-. "adjustment:&lt;key&gt;<br/>a person's decision, with a cause" .-> A
 ```
 
 ## A payout, end to end

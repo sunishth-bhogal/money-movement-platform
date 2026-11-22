@@ -4,7 +4,7 @@
 //   docker compose run --rm seed npx tsx scripts/compose-smoke.ts
 //
 // It only talks HTTP, like a user would: it checks the seeded withdrawals
-// play out, the core API refuses callers without the right credentials, a
+// play out, the seeded organizers are paid with statements that add up, the core API refuses callers without the right credentials, a
 // payout survives a lossy bank, a double-sent transfer moves money once, and
 // reconciliation against the bank's statement comes out clean.
 import { randomUUID } from "node:crypto";
@@ -66,7 +66,7 @@ console.log(`Smoke-testing the demo at ${API}`);
 
 // --- It is up --------------------------------------------------------------
 check("GET /health", (await call("GET", "/health")).status === 200);
-for (const page of ["/wallet/", "/dashboard/"]) {
+for (const page of ["/portal/", "/wallet/", "/dashboard/"]) {
   const res = await call("GET", page);
   check(`${page} serves the app`, res.status === 200 && String(res.json).includes("<div id="), res.status);
 }
@@ -135,6 +135,22 @@ await eventually(
 await call("POST", "/me/demo/bank", alice, { loseResponses: 0, webhookCopies: 1 });
 const afterPayout = (await call("GET", `/accounts/${id.alice}`, ADMIN)).json.balance_cents as number;
 check("... and Alice's balance went down by $2.00 once", afterPayout === afterTransfer - 200, { afterTransfer, afterPayout });
+
+// --- The seeded organizers are paid, and every payout explains itself ------
+const orgs = (await call("GET", "/organizer/demo-organizers")).json.data as { id: string; name: string }[];
+const northside = orgs.find((o) => o.name === "Northside Sports Club");
+check("the seed created the event organizers", Boolean(northside && orgs.some((o) => o.name === "Lakeview Live")), orgs);
+if (northside) {
+  const token = (await call("POST", "/organizer/session", {}, { organizer_id: northside.id })).json.token as string;
+  const overview = await eventually(
+    "... and Northside's two payouts are paid ($172.35, then $32.00 after the chargeback)",
+    async () => (await call("GET", "/organizer/", { authorization: `Bearer ${token}` })).json,
+    (o) => o.payouts?.map((p: any) => `${p.payout.status}:${p.payout.amount_cents}`).join(",") === "succeeded:3200,succeeded:17235",
+  );
+  check("... and every statement adds up to the cent", [overview.upcoming, ...overview.payouts].every((p: any) => p.balanced), overview.payouts?.map((p: any) => p.balanced));
+}
+const invariants = (await call("GET", "/admin/events/invariants", ADMIN)).json;
+check("every order, ticket, refund and dispute matches the ledger", invariants.ok === true, invariants.problems);
 
 // --- Reconciliation against the bank's statement is clean ---------------
 const run = await call("POST", "/admin/reconciliation/runs", ADMIN, { source: "mock_bank", currency: "USD" });
