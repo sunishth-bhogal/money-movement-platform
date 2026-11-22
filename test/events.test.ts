@@ -553,6 +553,14 @@ describe("cancel the event while the bank connector is down", () => {
       ]),
     );
     expect(upcoming.sections.find((s) => s.title === "Your account")!.lines[0].items[0].memo).toContain("Repaid by bank transfer");
+
+    // The audit trail of one order: its sale, its fee, the refund, and the refund settling.
+    const trace = await app.inject({ method: "GET", url: `/admin/orders/${o1.id}/trace`, headers: AUTH });
+    expect(trace.statusCode).toBe(200);
+    const keys = (trace.json().transfers as { idempotency_key: string }[]).map((t) => t.idempotency_key.split(":").slice(0, 1).concat(t.idempotency_key.split(":").slice(2)).join(":"));
+    expect(keys).toEqual(expect.arrayContaining([`order:sale:${a.id}`, `order:fee:${a.id}`, `refund:fee:${a.id}`, "refund:settle"]));
+    const mine = await app.inject({ method: "GET", url: `/organizer/orders/${o1.id}`, headers: asOrganizer(a.id) });
+    expect(mine.statusCode).toBe(200);
   });
 
   it("if the bank fails the advance instead, the money comes back and the obligation clears itself", async () => {

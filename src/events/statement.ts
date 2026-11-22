@@ -357,7 +357,7 @@ export async function organizerOverview(pool: pg.Pool | pg.PoolClient, organizer
     if (sold.count > 0) out.push(`You sold ${formatCents(sold.amount, cur)} in tickets (${sold.count} ticket${sold.count === 1 ? "" : "s"}).`);
     const fees = sum("platform_fee");
     const back = sum("fee_returned");
-    if (fees.amount) out.push(`Platform fees: ${formatCents(fees.amount + back.amount, cur)}${back.amount ? ` (after ${formatCents(back.amount, cur)} returned on refunds)` : ""}.`);
+    if (fees.amount) out.push(`Platform fees: ${formatCents(fees.amount + back.amount, cur)}${back.amount ? ` (after ${formatCents(back.amount, cur)} returned on refunds and chargebacks)` : ""}.`);
     const refunds = sum("refund");
     if (refunds.count) out.push(`Refunds to customers: ${formatCents(refunds.amount, cur)} (${refunds.count}).`);
     const cb = sum("dispute");
@@ -377,7 +377,7 @@ export async function organizerOverview(pool: pg.Pool | pg.PoolClient, organizer
     if (what === "payout") out.push(`So this payout is ${formatCents(total, cur)}.`);
     else if (total > 0) out.push(`So your next payout is ${formatCents(total, cur)} so far.`);
     else if (total < 0) out.push(`So you owe ${formatCents(-total, cur)}. It comes out of your next payout before anything is paid to you.`);
-    else out.push("Nothing is waiting to be paid out.");
+    else out.push(out.length ? "These cancel out: nothing is waiting to be paid out." : "Nothing is waiting to be paid out.");
     return out;
   };
 

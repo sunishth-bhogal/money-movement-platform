@@ -124,8 +124,8 @@ export async function orderTrace(pool: pg.Pool, orderId: string, organizerId?: s
        JOIN accounts a ON a.id = e.account_id
        LEFT JOIN organizer_postings p ON p.transfer_id = t.id
       WHERE t.idempotency_scope = 'system'
-        AND (t.idempotency_key LIKE 'order:' || $1 || ':%'
-             OR split_part(t.idempotency_key, ':', 2) IN (SELECT id::text FROM refunds WHERE order_id = $1 UNION ALL SELECT id::text FROM disputes WHERE order_id = $1))
+        AND (t.idempotency_key LIKE 'order:' || $1::text || ':%'
+             OR split_part(t.idempotency_key, ':', 2) IN (SELECT id::text FROM refunds WHERE order_id = $1::uuid UNION ALL SELECT id::text FROM disputes WHERE order_id = $1::uuid))
         AND ($2::uuid IS NULL OR p.organizer_id IS NULL OR p.organizer_id = $2)
       GROUP BY t.id, p.kind, p.organizer_id, p.memo
       ORDER BY t.created_at, t.id`,
