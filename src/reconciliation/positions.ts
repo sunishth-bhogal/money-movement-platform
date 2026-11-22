@@ -41,11 +41,16 @@ export const CONTROL: Record<ReconSource, ControlDimension[]> = {
   stripe: [{ dimension: "settled", systemCode: "stripe_clearing", name: "Stripe clearing", sign: -1 }],
 };
 
-/** The system-scoped transfer keys that belong to a source's items: payout:<id>:<step>, deposit:<id>. */
-const KEY_PREFIX: Record<ReconSource, string> = { mock_bank: "payout", stripe: "deposit" };
+/**
+ * The system-scoped transfer keys that belong to a source's items:
+ * payout:<id>:<step> for the bank; deposit:<id> and order:<id>:<step> (a
+ * ticket order's sale postings) for Stripe.
+ */
+const KEY_PREFIXES: Record<ReconSource, string[]> = { mock_bank: ["payout"], stripe: ["deposit", "order"] };
 
-/** The key a payout or deposit is known by in reconciliation, across runs. */
-export const objectBreakKey = (source: ReconSource, id: string) => `${KEY_PREFIX[source]}:${id}`;
+/** The key a payout, deposit or ticket order is known by in reconciliation, across runs. */
+export const objectBreakKey = (source: ReconSource, id: string, type: "payout" | "deposit" | "order" = source === "mock_bank" ? "payout" : "deposit") =>
+  `${KEY_PREFIXES[source].includes(type) ? type : KEY_PREFIXES[source][0]}:${id}`;
 
 /**
  * Where every cent on a source's control accounts came from, grouped by item.
@@ -66,14 +71,14 @@ export async function ledgerPositions(
 ): Promise<{ byKey: Map<string, Position>; balances: Position; unattributed: Position }> {
   const dims = CONTROL[source];
   const codes = dims.map((d) => d.systemCode);
-  const prefix = KEY_PREFIX[source];
+  const prefixes = KEY_PREFIXES[source];
   const { rows } = await db.query<{ break_key: string; system_code: string; net: number }>(
     `WITH ctl AS (
        SELECT id, system_code FROM accounts WHERE currency = $1 AND system_code = ANY($2::text[])
      ), attributed AS (
-       SELECT t.id AS transfer_id, $3 || ':' || split_part(t.idempotency_key, ':', 2) AS break_key
+       SELECT t.id AS transfer_id, split_part(t.idempotency_key, ':', 1) || ':' || split_part(t.idempotency_key, ':', 2) AS break_key
          FROM transfers t
-        WHERE t.idempotency_scope = 'system' AND t.idempotency_key LIKE $3 || ':%' AND t.currency = $1
+        WHERE t.idempotency_scope = 'system' AND split_part(t.idempotency_key, ':', 1) = ANY($3::text[]) AND t.currency = $1
        UNION ALL
        SELECT p.transfer_id, r.break_key
          FROM reconciliation_resolution_postings p
@@ -85,7 +90,7 @@ export async function ledgerPositions(
        JOIN attributed a ON a.transfer_id = e.transfer_id
       WHERE ($4::text IS NULL OR a.break_key = $4)
       GROUP BY 1, 2`,
-    [currency, codes, prefix, onlyKey ?? null],
+    [currency, codes, prefixes, onlyKey ?? null],
   );
   const byKey = new Map<string, Position>();
   const attributedTotal: Position = { ...ZERO };

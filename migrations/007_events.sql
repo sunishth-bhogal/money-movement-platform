@@ -128,12 +128,16 @@ CREATE TABLE orders (
   stripe_payment_intent_id    TEXT,
   checkout_url                TEXT,
   failure_reason              TEXT,
+  -- [{organizer_id, gross_cents, fee_cents}]: how the payment divided between
+  -- the event's organizers and the platform fee, fixed when it was paid.
+  sale_shares                 JSONB,
   paid_at                     TIMESTAMPTZ,
   created_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at                  TIMESTAMPTZ NOT NULL DEFAULT now(),
   CONSTRAINT orders_idempotency_key_unique UNIQUE (idempotency_key),
   CONSTRAINT orders_session_unique UNIQUE (stripe_checkout_session_id),
-  CONSTRAINT orders_paid_has_time CHECK ((status = 'paid') = (paid_at IS NOT NULL))
+  CONSTRAINT orders_paid_has_time CHECK ((status = 'paid') = (paid_at IS NOT NULL)),
+  CONSTRAINT orders_paid_has_shares CHECK ((status = 'paid') = (sale_shares IS NOT NULL))
 );
 CREATE INDEX orders_event_idx ON orders (event_id, created_at);
 CREATE INDEX orders_payment_intent_idx ON orders (stripe_payment_intent_id) WHERE stripe_payment_intent_id IS NOT NULL;

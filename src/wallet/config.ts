@@ -21,6 +21,7 @@ export function loadWalletConfig(
 
   if (env.DEMO_MODE !== "true") return { payments, wallet, notes };
 
+  wallet.demoMode = true;
   wallet.demoBankUrl = env.BANK_API_URL || undefined;
   if (payments.gateway) {
     notes.push("DEMO_MODE: STRIPE_SECRET_KEY is set, so deposits use real Stripe Checkout (test mode)");

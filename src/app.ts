@@ -12,6 +12,7 @@ import { BANK_SIGNATURE_HEADER, verifyBankWebhook } from "./bank/signature.js";
 import { createPayout, getPayout, handleBankWebhook, type Payout } from "./payouts/payouts.js";
 import { registerAdminRoutes, type AdminOptions } from "./admin/routes.js";
 import { registerWalletRoutes, type WalletOptions } from "./wallet/routes.js";
+import { registerEventRoutes } from "./events/routes.js";
 
 const uuid = z.string().uuid();
 const currency = z.string().regex(/^[A-Z]{3}$/, "ISO 4217 code, e.g. USD");
@@ -277,6 +278,14 @@ export function buildApp(
 
   registerAdminRoutes(app, pool, opts.admin ?? { providers: {} });
   registerWalletRoutes(app, pool, payments, opts.wallet ?? {});
+  registerEventRoutes(app, pool, {
+    payments,
+    adminToken: opts.admin?.token,
+    sessionSecret: opts.wallet?.sessionSecret,
+    demo: opts.wallet?.demoMode,
+    demoCheckout: opts.wallet?.demoCheckout,
+    demoBankUrl: opts.wallet?.demoBankUrl,
+  });
 
   return app;
 }
