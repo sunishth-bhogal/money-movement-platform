@@ -23,6 +23,8 @@ export interface WalletOptions {
   demoCheckout?: boolean;
   /** The mock bank's base URL, to expose its chaos switches to the wallet's demo panel. */
   demoBankUrl?: string;
+  /** DEMO_MODE=true: local demo controls are on (see loadWalletConfig). */
+  demoMode?: boolean;
 }
 
 const uuid = z.string().uuid();

@@ -59,6 +59,12 @@ services:
       OUTBOX_WEBHOOK_URL: ${OUTBOX_WEBHOOK_URL:-}
       # Sends payouts to the mock bank and reconciles quiet ones.
       BANK_API_URL: http://mock-bank:4000
+      # Ticket refunds: sent to Stripe when a test key is set, otherwise
+      # confirmed by the demo refund gateway (local demos only).
+      STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
+      DEMO_MODE: ${DEMO_MODE:-true}
+      # How often the worker releases finished events and pays organizers.
+      PAYOUT_SCHEDULE_EVERY_MS: ${PAYOUT_SCHEDULE_EVERY_MS:-5000}
     depends_on:
       db:
         condition: service_healthy
@@ -75,7 +81,7 @@ services:
     ports:
       - "4000:4000"
 
-  # Seeds Alice, Bob and Carol with a history once the API is up, then exits.
+  # Seeds two event organizers and Alice, Bob and Carol with a history once the API is up, then exits.
   # Safe to run again: it uses fixed idempotency keys, so a re-run changes nothing.
   seed:
     build: .
@@ -83,6 +89,7 @@ services:
     environment:
       DATABASE_URL: postgres://postgres:postgres@db:5432/money_dev
       API_URL: http://api:3000
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-local-admin-token}
       APP_BASE_URL: ${APP_BASE_URL:-http://localhost:3000}
     restart: "no"
     depends_on:

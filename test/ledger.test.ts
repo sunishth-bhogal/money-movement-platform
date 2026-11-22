@@ -74,7 +74,7 @@ describe("database-level invariants (defence in depth)", () => {
     expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
     const failure = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
     expect(failure.reason.code).toBe("23514"); // check_violation
-    expect(failure.reason.constraint).toBe("user_balance_non_negative");
+    expect(failure.reason.constraint).toBe("balance_non_negative");
     expect(await balanceOf(alice)).toBe(1000);
   });
 });

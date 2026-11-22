@@ -1,9 +1,20 @@
 # Money Movement Platform
 
-A fictional money movement platform built in stages, with a focus on one thing:
-**staying correct when requests are duplicated, raced, or lost.**
+**Ticket sales and payouts for small event organizers**, on top of a money
+movement platform built in stages with a focus on one thing: **staying correct
+when requests are duplicated, raced, or lost.**
 
-So far: accounts, an immutable double-entry ledger, an internal `POST /transfers`
+The product: a sports club or a small promoter sells tickets through Stripe
+Checkout (test mode). The platform takes its fee, holds the proceeds until the
+event has happened (so refunds can be paid from them), splits them between
+co-hosts, and pays each organizer through a (mock) bank. When an event is
+cancelled, a buyer asks for a partial refund, or a card is charged back after
+the organizer was paid, the ledger records who owes what, and the organizer's
+**payout statement** explains every payout to the cent, down to the ticket:
+*"you sold $X, here are the fees, refunds and adjustments, here is why your
+payout is $Y."* See [Ticketing and organizer payouts](#ticketing-and-organizer-payouts).
+
+Underneath: accounts, an immutable double-entry ledger, an internal `POST /transfers`
 endpoint that is idempotent and safe under concurrency, deposits through
 **Stripe Checkout in test mode**, credited only by a verified webhook, and a
 **transactional outbox** with a worker that publishes every money movement with
@@ -15,9 +26,11 @@ wallet** where a user sees their balances and full history, adds funds, sends
 money and withdraws, with every pending, settled and failed state visible. All
 money and accounts are fictional, and Stripe is only ever used in test mode.
 
-**Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Stripe (test mode), React + Vite (wallet and admin dashboard), Vitest, Docker.
+**Stack:** TypeScript, Node.js, Fastify, PostgreSQL 16, Stripe (test mode), React + Vite (organizer portal, wallet and admin dashboard), Vitest, Docker.
 
 **Start here:** [architecture diagrams](docs/ARCHITECTURE.md) ·
+[the event-cancellation demo](docs/demo/README.md#the-organizer-story-cancel-an-event-while-the-bank-is-down)
+(sell tickets, cancel during a bank outage, refund, obligation, recovery, audit trail) ·
 [failure-scenario demo](docs/demo/README.md) (duplicate transfer, duplicate
 webhook, lost bank response, as a recording and a script) ·
 [interview talking points](docs/INTERVIEW.md).
@@ -29,9 +42,13 @@ docker compose up --build      # or: npm run demo
 ```
 
 This starts Postgres, the API, the outbox worker and the mock bank, then seeds
-Alice, Bob and Carol with a history (the `seed` service prints a summary and
-exits). Open:
+two event organizers and three wallet users with a history (the `seed` service
+prints a summary and exits). Open:
 
+- **Organizer portal:** <http://localhost:3000/portal/>. The *Box office* tab
+  sells tickets; the *Organizer* tab signs in as **Northside Sports Club** or
+  **Lakeview Live** (a demo: no password) and shows their payouts, held
+  proceeds and events.
 - **Wallet:** <http://localhost:3000/wallet/>. Pick a user: sign-in is a demo,
   no password. Each tab keeps its own sign-in, so Alice and Bob can be open side by side.
 - **Admin dashboard:** <http://localhost:3000/dashboard/>, token `local-admin-token`.
@@ -40,6 +57,21 @@ No Stripe account is needed: with `DEMO_MODE=true` (the compose default) and no
 `STRIPE_SECRET_KEY`, **Add funds** opens a demo checkout page instead of Stripe
 (see [the wallet](#the-wallet-user-dashboard)). Set test-mode Stripe keys and it
 uses real Stripe Checkout instead.
+
+Things to try in the organizer portal:
+
+| Try | What you see |
+|---|---|
+| Sign in as **Northside Sports Club** → *Payouts* | Two paid payouts. The $172.35 one: $190.00 sold, fees, a $5.00 partial refund. The $32.00 one: the Quiz Night's $75.00, minus a $30.00 chargeback (plus a $15.00 fee) on the fun run that had already been paid out. Each line opens to the tickets and orders behind it; each order opens to its ledger trace. *Adds up to the cent* is checked, not asserted. |
+| *Held until after your events* | Northside's 40% of the co-hosted Harbor Lights Concert, held until after it happens. Lakeview sees its 60%. |
+| *Box office* → buy a ticket → *Pay by card* | The order is paid by a signed Stripe event through the real webhook, and the organizer's held balance goes up by the price minus the fee. *Pay, and Stripe delivers the webhook twice* credits it once. |
+| *Events* → an event → *refund* on one ticket, for part of its price | The refund comes out of held money, the platform returns its share of the fee, and the refund settles when Stripe confirms. |
+| *Demo controls* → **Bank connector down**, then *Take an early payout* on Harbor Lights, then *Cancel event…* | The early payout waits; every buyer is refunded at once; what was paid early becomes *You owe*. Switch the bank back on and the early payout is sent exactly once. |
+| *Demo: the event happens now* on an event | Demo only: the event "happens", its money is released and paid out by the schedule. |
+| An order → *Demo: chargeback* → *lost* | After payout: the organizer owes it, and the next statement says so. |
+
+Or run the whole story as a checked script: `bash docs/demo/event-cancellation.sh`
+(see [the demo](docs/demo/README.md#the-organizer-story-cancel-an-event-while-the-bank-is-down)).
 
 Things to try in the wallet:
 
@@ -57,7 +89,8 @@ Things to try in the wallet:
 
 Running the seed again (`docker compose run --rm seed`) changes nothing: every
 request it makes has a fixed idempotency key, so each one is answered from the
-first run. The wallet can also be run in development with `npm run wallet`
+first run. The portal and the wallet can also be run in development with
+`npm run portal` (Vite on :5175) and `npm run wallet`
 (Vite on :5174, proxying `/me` to the API) after `npm run dev`; seed with
 `npm run demo:seed` (needs the API running, with `WALLET_SESSION_SECRET` set).
 
@@ -254,12 +287,37 @@ The admin API needs `Authorization: Bearer <ADMIN_TOKEN>` (`401` without it, `50
 | `POST` | `/admin/reconciliation/runs` | `{ source: "mock_bank" \| "stripe", currency }`. Runs now. `201` with the run, `502` with a `failed` run if the provider's statement could not be read, `409 run_in_progress`. |
 | `GET` | `/admin/reconciliation/runs`, `/admin/reconciliation/runs/:id` | Runs, and one run with its items. |
 | `GET` | `/admin/reconciliation/breaks` | Open and in-transit items from the latest runs. `?include_resolved=true` adds resolved ones. |
-| `POST` | `/admin/reconciliation/items/:id/resolve` | `{ action: "accept_provider" \| "accept_ours", counterparty?: "user" \| "platform", note, resolved_by }`. `201`; the same request again replays it. `409` for `stale_item`, `ledger_changed`, `already_resolved`; `422 insufficient_funds`. |
+| `POST` | `/admin/reconciliation/items/:id/resolve` | `{ action: "accept_provider" \| "accept_ours", cause, counterparty?: "user" \| "platform", note, resolved_by }`. `cause` is why they disagreed: `missed_notification`, `provider_error`, `our_error`, `timing`, `fraud_suspected` or `other`. `201`; the same request again replays it. `409` for `stale_item`, `ledger_changed`, `already_resolved`; `422 insufficient_funds`. |
 | `GET` | `/admin/reconciliation/trace?break_key=payout:<id>` | Every ledger transfer, run and decision behind one item. |
 | `GET` | `/admin/resolutions` | The audit log. |
 | `GET` | `/admin/payouts/flagged` | Payouts the bank contradicted, and payouts held for over an hour. |
 | `POST` | `/admin/payouts/:id/acknowledge` | `{ note, resolved_by }`. Records that a person looked at a flag. Moves no money. |
 | `GET` / `POST` | `/admin/outbox/dead`, `/admin/outbox/:event_id/requeue` | Dead events, and putting one back in the queue. |
+
+The ticketing API. Operators (`ADMIN_TOKEN`) create organizers and events;
+buyers use the public box office; organizers sign in to `/organizer`
+(`POST /organizer/session`, a demo sign-in like the wallet's) and see and act
+only on their own events and orders (`404` for anyone else's).
+
+| Method | Path | Notes |
+|---|---|---|
+| `POST` | `/organizers` | Operator. `{ name, currency, bank_account_number }`. Creates the organizer and their two accounts (held, available). |
+| `POST` | `/events` | Operator. `{ name, venue?, currency, starts_at, ends_at, fee_bps?, fee_fixed_cents?, hold_hours?, advance_bps?, organizers: [{ organizer_id, share_bps }], ticket_types: [{ name, price_cents, capacity }] }`. Shares must total 100%. Defaults: 5% + $0.50 a ticket, held 48 hours after the event, no early payout. |
+| `GET` | `/box-office/events` | Events on sale, with seats left. |
+| `POST` | `/box-office/events/:id/orders` | `Idempotency-Key` required. `{ buyer_name, buyer_email, items: [{ ticket_type_id, quantity }] }`. Reserves the seats (`409 sold_out` otherwise) and opens Stripe Checkout. Moves no money. |
+| `GET` | `/box-office/orders/:id` | The buyer's order: tickets, refunds, and the event's status. |
+| `POST` | `/box-office/orders/:id/demo-checkout` | `DEMO_MODE` only. Like the wallet's: signed Stripe events through `/webhooks/stripe`. |
+| `GET` | `/organizer/` | The home page: balances (`held`, `available`, `in_flight`, `owed_by_organizer`), the next payout's statement so far, held events, and every payout's statement. |
+| `GET` | `/organizer/events`, `/organizer/events/:id`, `/organizer/orders/:id` | Events with totals; one event's orders and tickets; one order's ledger trace. |
+| `POST` | `/organizer/orders/:id/refunds` | `Idempotency-Key` required. `{ ticket_id?, amount_cents?, reason, note? }`. Without `ticket_id`, everything left on the order; with it, that ticket, or part of it. |
+| `POST` | `/organizer/events/:id/cancel` | `{ reason }`. Stops sales and refunds every paid order in full. Again: changes nothing. |
+| `POST` | `/organizer/events/:id/advance` | An early payout of up to the event's `advance_bps` of what is held, once, before the event. |
+| `POST` | `/organizer/demo/...` | `DEMO_MODE` only: `events/:id/finish`, `orders/:id/dispute` (`open`, `won`, `lost`), `run-schedule`, and the bank's `outage` switch. |
+| `GET` | `/admin/organizers`, `/admin/organizers/:id/statement` | Every organizer's balances; one organizer's statements. |
+| `POST` | `/admin/organizers/:id/adjustments` | `Idempotency-Key` required. `{ amount_cents, cause, note, decided_by, event_id?, order_id?, dispute_id? }`. `cause` is `organizer_repaid`, `debt_written_off`, `goodwill_credit` or `correction`. A ledger transfer against *organizer adjustments*, on the organizer's next statement. |
+| `GET` | `/admin/orders/:id/trace` | Every ledger transfer behind one order: sale, fees, refunds, disputes. |
+| `POST` | `/admin/payout-schedule/run` | Release finished events and pay organizers now (the worker does it every `PAYOUT_SCHEDULE_EVERY_MS`, default 30s). |
+| `GET` | `/admin/events/invariants` | Cross-checks every order, ticket, refund and dispute against the ledger. `{ ok, problems }`. |
 
 `POST /transfers` responses:
 
@@ -294,6 +352,23 @@ reconciliation_items                run_id, break_key, classification, outcome, 
 reconciliation_resolutions          item_id UNIQUE | payout_id, action, counterparty, note,
                                     resolved_by, fingerprint                                  -- append-only
 reconciliation_resolution_postings  resolution_id, transfer_id UNIQUE                         -- append-only
+
+-- ticketing (migration 007)
+organizers            id, name, currency, bank_account_number, held_account_id, available_account_id
+events                id, name, starts_at, ends_at, fee_bps, fee_fixed_cents, hold_hours, advance_bps,
+                      status (on_sale|cancelled), cancel_reason, released_at
+event_organizers      event_id, organizer_id, share_bps                   -- shares total 10000
+ticket_types          id, event_id, name, price_cents, capacity
+orders                id, idempotency_key UNIQUE, event_id, buyer, amount_cents, fee_cents, status,
+                      stripe_checkout_session_id, stripe_payment_intent_id, sale_shares
+tickets               id, order_id, ticket_type_id, price_cents, fee_cents, status, refunded_cents
+refunds               id, idempotency_key UNIQUE, order_id, ticket_id?, amount_cents, reason,
+                      status (pending|succeeded|requires_review), shares, stripe_refund_id
+disputes              id, stripe_dispute_id UNIQUE, order_id, amount_cents, fee_cents, status (open|won|lost), shares
+organizer_adjustments id, idempotency_key UNIQUE, organizer_id, amount_cents, cause, note, decided_by, transfer_id
+organizer_postings    transfer_id PRIMARY KEY, organizer_id, kind, memo            -- append-only; why each organizer entry exists
+payouts               + organizer_id, event_id
+reconciliation_resolutions  + cause
 ```
 
 See [`migrations/`](migrations/).
@@ -891,6 +966,102 @@ reconciliation compares, session by session, with Stripe's own records.
   Sessions that expired without payment are left `pending` (no money is at
   stake); syncing that label is a small follow-up.
 
+### Ticketing and organizer payouts
+
+The product layer (`src/events/`, migration `007`) is built from the same parts
+as everything else: ledger transfers with idempotency keys, Stripe Checkout and
+its verified webhook, the outbox, the bank connector, reconciliation. Nothing
+in it updates a balance; every movement is a transfer.
+
+**Where an organizer's money sits.** Each organizer has two ledger accounts:
+
+```
+Stripe clearing ──sale──► held ──fee──► Platform fees
+                           │ └─refund─► Refunds in flight ──► Refunded through Stripe
+                           └─release (after the event)─► available ──payout─► Payouts in flight ──► Bank
+```
+
+- **held** (`organizer_held`): proceeds of events that have not happened yet.
+  Refunds come out of it first. It can never go negative: the same database
+  `CHECK` that protects a user's balance.
+- **available** (`organizer`): released proceeds, ready to pay out. It *may* go
+  negative. A refund or chargeback after the money was paid out means the
+  organizer owes the platform, and that is a real state of the business, so the
+  ledger shows it instead of hiding it. The next payout is smaller by exactly
+  that amount, with the reason on the statement, or a person records how it was
+  settled (below).
+
+**A sale.** The order reserves seats under the event's row lock (`409 sold_out`
+for the loser of a race for the last seat) and opens Checkout; no money moves.
+The verified `checkout.session.completed` webhook posts, per organizer, the
+sale (`order:<id>:sale:<organizer>`, clearing → held) and the fee
+(`order:<id>:fee:<organizer>`, held → platform fees). A co-hosted event splits
+each sale by `share_bps` with a largest-remainder allocation in integer cents,
+so the shares always add up to the order exactly, and the fee follows each
+organizer's gross. A duplicate webhook finds those keys already used.
+
+**Refunds and cancellation.** A refund is a whole order, one ticket, or part of
+one ticket. It is split across the organizers in proportion to what each still
+has from that order, taken from held money first and then from available, and
+the platform returns the same fraction of its fee (all of what is left of it on
+the final refund, so the fee never goes negative and rounding never leaves a
+cent behind). The money goes to *refunds in flight*; the outbox's
+`refund.submit` asks Stripe (key `refund:<id>`) and the refund settles when
+Stripe confirms. A refund Stripe fails goes to `requires_review`: no money is
+moved back on a guess. Cancelling an event stops sales and refunds every paid
+order in full in the same transaction; a payment that arrives after the
+cancellation is recorded and refunded at once.
+
+**Chargebacks.** `charge.dispute.created` takes the disputed amount and
+Stripe's $15 fee from the organizers (held first, then available) into
+*disputes*. A dispute won brings the amount back; the fee stays lost, as at
+Stripe. If the dispute is larger than what is left of the order, the platform
+absorbs the excess.
+
+**Payouts.** The worker's payout schedule releases each event `hold_hours`
+after it ends (`event:<id>:release:<organizer>`) and pays the organizer's whole
+available balance through the existing bank connector
+(`event:<id>:payout:<organizer>`). The amount is read under the account's row
+lock, so a refund racing the payout is either in it or after it. An event can
+offer an **early payout** (`advance_bps`): up to that share of what is held,
+once per organizer, before the event starts. That is what makes cancelling
+interesting: what was paid early can no longer be refunded from held money, so
+it becomes the organizer's obligation.
+
+**Every entry has a reason.** Each transfer that touches an organizer account
+writes an `organizer_postings` row (kind, memo, the event, order, refund,
+dispute or payout) in the same transaction, and a deferred constraint trigger
+refuses to commit an organizer ledger entry without one. The payout statement
+is built from the ledger entries joined to those rows, not from the order
+tables, so it cannot leave anything out:
+
+- each payout's window runs from the previous payout's hold to this one;
+- lines are grouped by event (released after the event, paid early, or "after
+  it was paid out" for refunds and chargebacks that came later), then by kind,
+  and each line opens to the tickets and orders behind it;
+- a release or an advance is expanded into the sales, fees and refunds it
+  carried, with "Already paid out early" and "Held back until after the event"
+  where a release follows an advance;
+- `balanced` checks that the opening balance plus every line equals the payout,
+  and the summary sentences are generated from the same lines.
+
+**Decisions, not silent fixes.** An organizer who owes money and repays it, or
+a debt the platform writes off, is an **adjustment**: a transfer against
+*organizer adjustments* with a `cause` (`organizer_repaid`, `debt_written_off`,
+`goodwill_credit`, `correction`), a note and who decided it, which shows on the
+organizer's next statement. Reconciliation works the same way: a contradiction
+is a break for a person, and their resolution now records **why** the books
+and the provider disagreed (`missed_notification`, `provider_error`,
+`our_error`, `timing`, `fraud_suspected`, `other`) next to what they decided.
+Stripe reconciliation now also pairs ticket orders with their Checkout sessions
+(`order:<id>`), and settles a paid order whose webhook never came.
+
+**What the portal shows.** The *Payouts* tab is the explanation page: the next
+payout so far, what is held for each upcoming event, and every payout's
+statement with an *adds up to the cent* check. Each order opens to its ledger
+trace (`/organizer/orders/:id`). Organizers see only their own share of a
+co-hosted event.
+
 ### The wallet (user dashboard)
 
 The wallet ([`wallet/`](wallet/), served at `/wallet/`) is a React app over a
@@ -1005,7 +1176,18 @@ The tests run against real PostgreSQL. Concurrency bugs don't show up against mo
 | Does the wallet show the right state? | `stays pending until the (signed) webhook arrives, then settles once even if delivered twice`, `holds the money while pending, then settles, or fails and refunds` (with the statement's running balance) |
 | Does the form reuse its key? | `reuses the key while the form says the same thing ...`, `makes a new key when the form changes ...` (`test/wallet-client.test.ts`) |
 
-CI (GitHub Actions) runs the typecheck (API, dashboard and wallet), builds the dashboard and the wallet, and runs the full suite against a Postgres 16 service container.
+| Do co-host splits and fees add up to the cent? | `allocate always adds up exactly ...`, `partial refunds return the fee proportionally, never more than was charged, and all of it on the last one` |
+| Same ticket payment webhook twice? | `the same payment webhook twice, or a second event for the same payment, credits it once` |
+| Two buyers, one seat left? | `two buyers racing for the last seat: one gets it, the other is told it sold out` |
+| Partial refund of a ticket? | `a partial refund of one ticket comes out of held proceeds, returns its share of the fee, and settles when Stripe confirms` |
+| **Why is my payout $Y?** | `after the event, the schedule releases held money and pays each organizer once; the statement explains it to the cent` |
+| Chargeback after payout? | `a chargeback after payout makes the organizer owe it, and their next payout is smaller by exactly that, with the reason` |
+| **Cancel the event while the bank is down?** | `customers are refunded in full, the advance becomes the organizer's obligation, the payout goes out exactly once on recovery, and a recorded decision clears it` |
+| Payment lands after the cancellation? | `a payment that lands after the event was cancelled is recorded, and refunded straight away` |
+| Money on an organizer account that nothing explains? | `the database refuses money on an organizer's account that nothing explains`, `held proceeds can never go negative, even by a bug` |
+| Ticket webhook lost? | `reconciliation against Stripe matches ticket orders, and settles one whose webhook never came` |
+
+CI (GitHub Actions) runs the typecheck (API, dashboard, wallet and portal), builds the three apps, and runs the full suite against a Postgres 16 service container.
 
 ## Roadmap
 
@@ -1015,3 +1197,4 @@ CI (GitHub Actions) runs the typecheck (API, dashboard and wallet), builds the d
 4. ✅ **Bank connector:** payouts to a mock bank with delayed success, failures, returns, lost responses, duplicate webhooks and outages, and a reconciler that recovers when the bank and we disagree.
 5. ✅ **Reconciliation:** compare the ledger against the bank's and Stripe's records, prove the totals tie out, fix what the provider's record settles, and an admin dashboard where a person resolves the rest as auditable ledger postings.
 6. ✅ **User dashboard:** a React wallet for balances and full history, adding funds (Stripe test Checkout, or a demo checkout), transfers and withdrawals, with client-side idempotency keys, and a one-command seeded demo with switches for the bank's failure modes.
+7. ✅ **Product: payouts for small event organizers.** Events, tickets and orders on Stripe test Checkout, co-host splits, partial refunds, cancellations, chargebacks after payout, scheduled post-event payouts and early payouts through the mock bank, organizer obligations and recorded adjustments, reconciliation causes, and an organizer portal that explains every payout to the cent.

@@ -15,8 +15,9 @@ import {
   stuckPayouts,
   traceBreakKey,
 } from "../reconciliation/queries.js";
-import { acknowledgeFlag, listResolutions, resolveItem } from "../reconciliation/resolve.js";
+import { acknowledgeFlag, listResolutions, RESOLUTION_CAUSES, resolveItem } from "../reconciliation/resolve.js";
 import { getRun, listRuns, runReconciliation, type ReconProviders } from "../reconciliation/run.js";
+import { registerEventAdminRoutes } from "../events/routes.js";
 
 export interface AdminOptions {
   /** Bearer token for /admin. Unset: every /admin route answers 503. */
@@ -33,6 +34,8 @@ const runBody = z.object({ source: z.enum(RECON_SOURCES as [string, ...string[]]
 const resolveBody = z.object({
   action: z.enum(["accept_provider", "accept_ours"]),
   counterparty: z.enum(["user", "platform"]).optional(),
+  // Required: a correction must say why the books were wrong, not only what to do.
+  cause: z.enum(RESOLUTION_CAUSES),
   note,
   resolved_by: who,
 });
@@ -118,7 +121,7 @@ export function registerAdminRoutes(app: FastifyInstance, pool: pg.Pool, opts: A
       });
 
       admin.get("/reconciliation/trace", async (req) => {
-        const q = z.object({ break_key: z.string().regex(/^(payout|deposit|bank_payout|stripe_session):[\w-]+$/) }).parse(req.query);
+        const q = z.object({ break_key: z.string().regex(/^(payout|deposit|order|bank_payout|stripe_session):[\w-]+$/) }).parse(req.query);
         return traceBreakKey(pool, q.break_key);
       });
 
@@ -137,6 +140,9 @@ export function registerAdminRoutes(app: FastifyInstance, pool: pg.Pool, opts: A
       });
 
       admin.get("/outbox/dead", async () => ({ data: await deadEvents(pool) }));
+
+      // Organizers and events: balances, statements, adjustments, the payout schedule.
+      registerEventAdminRoutes(admin, pool);
 
       // Safe for payout.submit too: the bank call uses the same idempotency key every time.
       admin.post("/outbox/:event_id/requeue", async (req) => {

@@ -12,41 +12,64 @@ run live).
 
 ## The pitch (30 seconds)
 
-> I built a small money movement platform, deposits through Stripe, transfers
-> between users, payouts to a bank, to practise the part of payments that is
-> actually hard: staying correct when requests are duplicated, raced or lost.
-> Money lives in an append-only, double-entry ledger in Postgres, where the
-> database itself enforces that every transfer balances and history can't be
-> rewritten. Every money-moving call is idempotent, the side effects go through
-> a transactional outbox, the bank I integrate with is a mock that loses
-> responses and sends duplicate webhooks on purpose, and a reconciliation job
-> compares our books against the providers' and proves the totals tie out to
-> the cent. There are about 150 tests, all against a real Postgres, because
-> concurrency bugs don't show up against mocks.
+> I built payouts for small event organizers: a sports club sells tickets
+> through Stripe Checkout, the platform takes its fee, holds the proceeds until
+> the event has happened, splits them between co-hosts, and pays each organizer
+> through a bank connector. The interesting part is everything that goes wrong
+> after the sale: partial refunds, an event cancelled after the organizer was
+> paid early, a chargeback months later, a bank that is down. Money lives in an
+> append-only double-entry ledger in Postgres that the database itself keeps
+> balanced; every money-moving call is idempotent; and every payout has a
+> statement that explains it to the cent, down to the ticket. When the
+> organizer ends up owing money, the ledger shows it as a negative balance
+> instead of hiding it, and settling it is a recorded decision with a cause,
+> not a silent fix. There are about 180 tests, all against a real Postgres.
 
-If they want one sentence: *"Every failure I could think of has a test, and the
-database enforces the invariants, so a bug in my code can't silently lose money."*
+If they want one sentence: *"Every payout can explain itself to the cent, and
+the database refuses any organizer ledger entry that doesn't say why it exists."*
 
-## The demo (2 minutes)
+Why this product: it uses everything the platform was built for (Stripe
+Checkout, the ledger, idempotent transfers, the outbox, the bank connector,
+reconciliation), and it has the questions marketplaces (Eventbrite, Stripe
+Connect platforms, Shopify) actually lose money on: who pays for a refund after
+the payout, and how do you tell a customer why their payout is smaller.
+
+## The demo (3 minutes)
 
 ```bash
-docker compose up --build
-bash docs/demo/failure-scenarios.sh      # PAUSE=2 to slow it down while talking
+docker compose up --build                  # seeds two organizers and three wallet users
+bash docs/demo/event-cancellation.sh       # PAUSE=2 to slow it down while talking
 ```
 
-Three scenarios, each checked by the script:
+The story, each step checked by the script:
 
-1. **The same transfer sent twice at once → one transfer.** Two parallel
-   requests, one key. One is created, the other replayed; one posting.
-2. **The same webhook delivered more than once → one posting.** Stripe's
-   checkout event twice, then the bank's settlement event three times.
-3. **The bank's response is lost and no webhook comes → reconciliation resolves
-   it.** The bank has paid; we think it's pending. A reconciliation run reads the
-   bank's statement, settles it once, and its proof ties out.
+1. **Sell tickets.** Two orders, one with Stripe's webhook delivered twice: the
+   organizer's held balance goes up once, by the price minus the fee.
+2. **The bank connector goes down, and the organizer takes an early payout**
+   (half of what is held). It waits: the worker's calls fail with 503 and it
+   retries with backoff, same idempotency key.
+3. **The event is cancelled.** Every buyer is refunded in full at once; buyers
+   are never short. Held money covers what it can; what was paid early is now
+   the organizer's **obligation**, a negative available balance. Cancelling
+   again refunds nobody twice.
+4. **The bank comes back.** The early payout goes out exactly once (the bank
+   has one payout for it), and reconciliation agrees with the bank's statement.
+5. **The organizer repays.** An operator records it as an adjustment with a
+   cause (`organizer_repaid`), a note and who decided; the balance is back to
+   zero, and the statement shows the line.
+6. **The audit trail** of one order: sale, fee, the refund split between held
+   money and the organizer's balance, the fee returned, Stripe's confirmation.
 
-Then open the admin dashboard and show an open break (`/_admin/tamper` makes the
-bank change its story), the trace view, and a resolution posted as a new ledger
-transfer. See [`demo/README.md`](demo/README.md) for the commands.
+Then open the portal (<http://localhost:3000/portal/>, *Organizer* → Northside
+Sports Club) and show the killer screen: the $32.00 payout. *"You sold $80.00;
+fees $3.00; a chargeback on last month's fun run, $30.00 plus Stripe's $15.00
+fee, after that event had already been paid out; so this payout is $32.00."*
+Each line opens to the tickets behind it, each order to its ledger trace, and
+*adds up to the cent* is computed, not asserted.
+
+The original platform demo still works and is worth 1 minute if they ask about
+idempotency directly: `bash docs/demo/failure-scenarios.sh` (duplicate
+transfer, duplicate webhook, lost bank response; see [`demo/README.md`](demo/README.md)).
 
 ---
 
@@ -197,6 +220,54 @@ wallet keys per user (`wallet:<account>:<key>`), so two users can't collide or
 block each other. When the outcome is unknown, the UI says so and says pressing
 again is safe.
 
+### 7. Organizer payouts: *"Why is my payout $Y?"*
+
+**Answer.** Because the statement is built from the ledger, not from the order
+tables. Every transfer that touches an organizer's accounts writes a posting
+row (sale, fee, refund, fee returned, chargeback, release, advance, payout,
+adjustment, with the event, order or refund behind it) in the same
+transaction, and a deferred constraint trigger refuses to commit an organizer
+ledger entry that has no such row. So the statement can't leave anything out:
+each payout's window runs from the previous payout to this one, lines are
+grouped by event and kind, and `opening + Σ lines = payout` is checked and
+shown. If that check ever failed, the page would say so.
+
+- **Held vs available.** Proceeds are *held* until `hold_hours` after the event
+  (refunds come out of it first; the database refuses a negative held balance),
+  then *released* to *available* and paid out whole.
+- **Co-hosts.** Each sale is split by share with a largest-remainder allocation
+  in integer cents, so the parts always add up to the order exactly.
+- **Partial refunds.** Split across organizers in proportion to what each still
+  has from that order; the platform returns the same fraction of its fee, and
+  all of what's left of it on the final refund, so rounding never strands a cent.
+
+### 8. Cancellation and chargebacks: *"The event was cancelled after you paid the organizer. Who pays the buyers?"*
+
+**Answer.** The buyers are refunded in full, immediately; that's never in
+question. The organizer's held money covers what it can, and whatever was
+already paid out (an early payout, or a chargeback after the post-event
+payout) comes out of their *available* balance, which is allowed to go
+negative. That negative balance is the obligation: a fact in the ledger, not a
+number in someone's spreadsheet. It comes out of their next payout first, with
+the reason on the statement; or a person records how it was settled
+(`organizer_repaid`, `debt_written_off`, ...), as a transfer with a cause, a
+note and their name.
+
+- **During a bank outage** the early payout's money is already in *payouts in
+  flight* (held when it was created, with its outbox row, in one transaction),
+  so cancelling can't refund it a second time; when the bank comes back, the
+  retry uses the same key and the bank pays once.
+- **Chargebacks** take the amount plus Stripe's $15 fee; a dispute won brings
+  the amount back but not the fee, as at Stripe. If a dispute is bigger than
+  what's left of the order, the platform absorbs the excess rather than
+  charging an organizer for something they never received.
+- **A refund Stripe fails** goes to `requires_review`; no money is moved back
+  on a guess.
+
+**Proof:** `cancel the event while the bank connector is down: customers are
+refunded in full, the advance becomes the organizer's obligation, the payout
+goes out exactly once on recovery, and a recorded decision clears it`.
+
 ---
 
 ## Design trade-offs to be ready for
@@ -213,6 +284,10 @@ again is safe.
 | Hold money at request time | Debit only on bank success | The user can't spend money that's on its way out, and the hold + instruction commit atomically. |
 | Reconciliation on money positions | On status labels | Labels can disagree harmlessly; money in the wrong place can't. |
 | Humans resolve contradictions of final states | Auto-reverse | Code can't safely claw back money the user may have spent. Every decision is audited and posts a new transfer. |
+| Organizer's available balance may go negative | Block refunds once paid out; or the platform eats every loss | Buyers must be refunded regardless, and the debt is real; hiding it in a platform loss account loses the information that this organizer owes it. Held money can't go negative, so the obligation appears only once the money has really left. |
+| Hold proceeds until after the event | Pay out on every sale | Refunds and cancellations are paid from held money, so the common case never creates a debt. Early payouts are an explicit, capped, recorded choice. |
+| Return the platform fee on refunds | Keep it | A cancelled event shouldn't cost the organizer the fee on tickets they didn't sell. A product decision, and easy to change: the fee return is its own transfer. |
+| Statement from the ledger + posting reasons | Statement from orders and refunds tables | The ledger is what was paid. A trigger makes "a ledger entry with no reason" impossible, so the explanation is complete by construction. |
 | Tests against real Postgres | Mocks | Locks, deadlocks, `SKIP LOCKED` and unique-index races only exist in a real database. |
 
 ## Bugs I found, and traps I designed around
@@ -237,6 +312,15 @@ came back. Be clear about which is which if asked.
    account created money from nothing. **Fix:** API-scoped transfers must be
    between two user accounts (`403 system_account_not_allowed`).
 **Traps the obvious implementation falls into:**
+
+- **Refunding a cancelled event's early payout twice.** The obvious cancel
+  refunds from "what the organizer was owed", which still counts the early
+  payout the bank hasn't sent. Here it was already moved to *payouts in flight*
+  when the payout was created, so it's gone from the organizer's balances, and
+  the refund takes it from *available*, which goes negative, instead.
+- **A statement that adds up "most of the time".** Computing it from orders and
+  refunds misses chargeback fees, failed payouts and adjustments. Built from
+  ledger entries with a reason each, and checked, it can't.
 
 3. **The lost COMMIT acknowledgement.** The obvious handler treats any DB error
    as "failed". If COMMIT succeeds but the ack is lost, the server doesn't know.
@@ -319,6 +403,17 @@ list of buzzwords.
   that my mock bank doesn't model, like partial payouts or a changed amount
   after settlement. Reconciliation is the safety net for exactly that: it
   would show up as a break with money attributed to it.
+- **"Why is the organizer's balance allowed to be negative?"** Because after a
+  payout, a refund or chargeback can only be paid by the platform, and the
+  organizer genuinely owes it. Hiding it would mean writing it off silently.
+  The held balance can't go negative; the database enforces it.
+- **"How do you split $10.00 three ways?"** Integer cents, largest remainder:
+  $3.34, $3.33, $3.33, deterministic, always summing to the total.
+- **"Reconciliation found a contradiction. Do you fix it?"** Code fixes only
+  what the provider's final record settles, through the same function the
+  webhook uses. Everything else is a break for a person, who records a cause
+  (`missed_notification`, `provider_error`, `our_error`, ...) and a decision;
+  any correction is a new transfer linked to it.
 - **"What would you build next?"** Real auth on the raw API, then a bank-data
   connector (Plaid Sandbox) that syncs transactions and handles them moving
   from pending to posted, which is the same "converge to the provider's state"

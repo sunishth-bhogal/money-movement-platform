@@ -30,6 +30,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run dashboard:build
       - run: npm run wallet:build
+      - run: npm run portal:build
       - run: npm test
 
   # Boots the one-command demo exactly as the README says, and smoke-tests it

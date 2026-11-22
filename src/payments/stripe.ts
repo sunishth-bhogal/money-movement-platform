@@ -1,18 +1,37 @@
 import Stripe from "stripe";
 
-/** What the deposit flow needs from a payment provider. Faked in tests. */
+/** One line on the Checkout page. */
+export interface CheckoutLineItem {
+  name: string;
+  unitAmountCents: number;
+  quantity: number;
+}
+
+export interface CheckoutSessionInput {
+  /**
+   * What the session pays for: a wallet deposit or a ticket order. Sent as
+   * client_reference_id and as metadata (`deposit_id` / `order_id`), so the
+   * webhook finds it even if we crashed before saving the session id.
+   */
+  reference: { type: "deposit" | "order"; id: string };
+  lineItems: CheckoutLineItem[];
+  currency: string;
+  successUrl: string;
+  cancelUrl: string;
+}
+
+/** What the deposit and ticket flows need from a payment provider. Faked in tests. */
 export interface CheckoutGateway {
   createCheckoutSession(
-    input: {
-      depositId: string;
-      amountCents: number;
-      currency: string;
-      successUrl: string;
-      cancelUrl: string;
-    },
+    input: CheckoutSessionInput,
     /** Sent as Stripe's Idempotency-Key, so a retry returns the same session. */
     idempotencyKey: string,
   ): Promise<{ id: string; url: string }>;
+}
+
+/** The metadata a session carries for its reference: { deposit_id } or { order_id }. */
+export function referenceMetadata(reference: CheckoutSessionInput["reference"]): Record<string, string> {
+  return { [`${reference.type}_id`]: reference.id };
 }
 
 /** A Checkout Session as Stripe reports it, with the fields reconciliation compares. */
@@ -109,21 +128,19 @@ export function stripeCheckoutGateway(secretKey: string): CheckoutGateway {
       const session = await stripe.checkout.sessions.create(
         {
           mode: "payment",
-          // How the webhook finds the deposit. Set at creation, so it works even
-          // if we crashed before saving the session id.
-          client_reference_id: input.depositId,
-          metadata: { deposit_id: input.depositId },
-          payment_intent_data: { metadata: { deposit_id: input.depositId } },
-          line_items: [
-            {
-              quantity: 1,
-              price_data: {
-                currency: input.currency.toLowerCase(),
-                unit_amount: input.amountCents,
-                product_data: { name: "Account deposit (test mode)" },
-              },
+          // How the webhook finds the deposit or order. Set at creation, so it
+          // works even if we crashed before saving the session id.
+          client_reference_id: input.reference.id,
+          metadata: referenceMetadata(input.reference),
+          payment_intent_data: { metadata: referenceMetadata(input.reference) },
+          line_items: input.lineItems.map((item) => ({
+            quantity: item.quantity,
+            price_data: {
+              currency: input.currency.toLowerCase(),
+              unit_amount: item.unitAmountCents,
+              product_data: { name: item.name },
             },
-          ],
+          })),
           success_url: input.successUrl,
           cancel_url: input.cancelUrl,
         },

@@ -9,7 +9,7 @@ import { checkLedgerInvariants, createAccount } from "../src/ledger/accounts.js"
 import { createTransfer } from "../src/ledger/transfers.js";
 import { routingPublisher } from "../src/outbox/publishers.js";
 import { OutboxWorker, type Publisher } from "../src/outbox/worker.js";
-import type { CheckoutGateway, StripeRecordSource, StripeSessionRecord } from "../src/payments/stripe.js";
+import { referenceMetadata, type CheckoutGateway, type CheckoutSessionInput, type StripeRecordSource, type StripeSessionRecord } from "../src/payments/stripe.js";
 import { bankIdempotencyKey, checkPayoutInvariants, getPayout, PAYOUT_SUBMIT_EVENT } from "../src/payouts/payouts.js";
 import { payoutSubmitter } from "../src/payouts/submitter.js";
 import type { ReconRun } from "../src/reconciliation/run.js";
@@ -36,16 +36,16 @@ class FakeStripe implements CheckoutGateway, StripeRecordSource {
   failOnPage?: number;
   pageSize = 100;
 
-  async createCheckoutSession(input: { depositId: string; amountCents: number; currency: string }, idempotencyKey: string) {
+  async createCheckoutSession(input: CheckoutSessionInput, idempotencyKey: string) {
     const id = `cs_test_${idempotencyKey.split(":")[1].replaceAll("-", "")}`;
     if (!this.sessions.has(id)) {
       this.sessions.set(id, {
         id,
-        client_reference_id: input.depositId,
-        metadata: { deposit_id: input.depositId },
+        client_reference_id: input.reference.id,
+        metadata: referenceMetadata(input.reference),
         status: "open",
         payment_status: "unpaid",
-        amount_total: input.amountCents,
+        amount_total: input.lineItems.reduce((sum, l) => sum + l.unitAmountCents * l.quantity, 0),
         currency: input.currency.toLowerCase(),
         payment_intent: null,
         created: Math.floor(Date.now() / 1000),
@@ -290,7 +290,7 @@ function resolve(itemId: string, body: Record<string, unknown>) {
     method: "POST",
     url: `/admin/reconciliation/items/${itemId}/resolve`,
     headers: AUTH,
-    payload: { note: "checked with the provider", resolved_by: "ops@example.test", ...body },
+    payload: { note: "checked with the provider", cause: "provider_error", resolved_by: "ops@example.test", ...body },
   });
 }
 

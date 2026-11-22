@@ -344,9 +344,20 @@ function BreaksPanel({
   );
 }
 
+/** The causes the API accepts (RESOLUTION_CAUSES), in words. */
+const CAUSE_LABEL: Record<string, string> = {
+  missed_notification: "A webhook or response never reached us",
+  provider_error: "The provider's record is wrong",
+  our_error: "Our books are wrong (a bug or a manual mistake)",
+  timing: "Timing: both are right at different moments",
+  fraud_suspected: "Suspected fraud",
+  other: "Other (explain in the note)",
+};
+
 function BreakRow({ session, b, onDone, onTrace }: { session: Session; b: Break; onDone: () => Promise<void>; onTrace: (k: string) => void }) {
   const [choice, setChoice] = useState<string>(b.account_id ? "accept_provider:user" : "accept_provider:platform");
   const [note, setNote] = useState("");
+  const [cause, setCause] = useState("");
   const { busy, error, run } = useAction(onDone);
   const submit = (e: FormEvent) => {
     e.preventDefault();
@@ -355,6 +366,7 @@ function BreakRow({ session, b, onDone, onTrace }: { session: Session; b: Break;
       api(session, "POST", `/reconciliation/items/${b.id}/resolve`, {
         action,
         ...(counterparty ? { counterparty } : {}),
+        cause,
         note,
         resolved_by: session.name,
       }),
@@ -386,7 +398,8 @@ function BreakRow({ session, b, onDone, onTrace }: { session: Session; b: Break;
       {b.resolution ? (
         <p className="resolved">
           Resolved by {b.resolution.resolved_by}: {b.resolution.action.replace("_", " ")}
-          {b.resolution.counterparty ? ` (${b.resolution.counterparty})` : ""}. “{b.resolution.note}”
+          {b.resolution.counterparty ? ` (${b.resolution.counterparty})` : ""}
+          {b.resolution.cause ? `, cause: ${CAUSE_LABEL[b.resolution.cause] ?? b.resolution.cause}` : ""}. “{b.resolution.note}”
         </p>
       ) : (
         b.outcome === "open" && (
@@ -395,6 +408,16 @@ function BreakRow({ session, b, onDone, onTrace }: { session: Session; b: Break;
               {b.account_id && <option value="accept_provider:user">Provider is right: settle with the user's account</option>}
               <option value="accept_provider:platform">Provider is right: the platform absorbs the difference</option>
               <option value="accept_ours">Our ledger is right: move no money</option>
+            </select>
+            <select value={cause} onChange={(e) => setCause(e.target.value)} required aria-label="Cause">
+              <option value="" disabled>
+                Cause: why did they disagree?
+              </option>
+              {Object.entries(CAUSE_LABEL).map(([value, label]) => (
+                <option key={value} value={value}>
+                  {label}
+                </option>
+              ))}
             </select>
             <input placeholder="Why (required, kept with the decision)" value={note} onChange={(e) => setNote(e.target.value)} minLength={3} required />
             <button type="submit" disabled={busy}>

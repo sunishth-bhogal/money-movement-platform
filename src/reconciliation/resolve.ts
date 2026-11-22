@@ -6,10 +6,19 @@ import { createTransferInTx } from "../ledger/transfers.js";
 import { enqueueOutboxEvent } from "../outbox/outbox.js";
 import { stripeClearingAccount } from "../payments/deposits.js";
 import { bankPayoutsAccount, inFlightAccount, systemAccount } from "../payouts/payouts.js";
+import { organizerOfAccount, recordOrganizerPosting } from "../organizers/postings.js";
 import { CONTROL, ledgerPositions, lockBreakKey, type Position, type ReconSource } from "./positions.js";
 
 export type ResolutionAction = "accept_provider" | "accept_ours";
 export type Counterparty = "user" | "platform";
+
+/**
+ * Why the books and the provider disagreed, as the person resolving it
+ * concluded. Together with the action (the decision) and the note, it is what
+ * makes a correction auditable: an identifiable cause and an explicit decision.
+ */
+export const RESOLUTION_CAUSES = ["missed_notification", "provider_error", "our_error", "timing", "fraud_suspected", "other"] as const;
+export type ResolutionCause = (typeof RESOLUTION_CAUSES)[number];
 
 export interface Resolution {
   id: string;
@@ -19,6 +28,7 @@ export interface Resolution {
   fingerprint: string;
   action: ResolutionAction | "acknowledge_flag";
   counterparty: Counterparty | null;
+  cause: ResolutionCause | null;
   note: string;
   resolved_by: string;
   created_at: Date;
@@ -29,6 +39,7 @@ export interface ResolveRequest {
   action: ResolutionAction;
   /** Required for accept_provider: who gives or receives what is left after moving money between our control accounts. */
   counterparty?: Counterparty;
+  cause: ResolutionCause;
   note: string;
   resolved_by: string;
 }
@@ -42,7 +53,7 @@ interface ItemRow {
   run_id: string;
   source: ReconSource;
   break_key: string;
-  object_type: "payout" | "deposit";
+  object_type: "payout" | "deposit" | "order";
   object_id: string | null;
   account_id: string | null;
   outcome: string;
@@ -55,7 +66,7 @@ interface ItemRow {
 }
 
 const RESOLUTION_COLUMNS =
-  "r.id, r.item_id, r.payout_id, r.break_key, r.fingerprint, r.action, r.counterparty, r.note, r.resolved_by, r.created_at, " +
+  "r.id, r.item_id, r.payout_id, r.break_key, r.fingerprint, r.action, r.counterparty, r.cause, r.note, r.resolved_by, r.created_at, " +
   "COALESCE((SELECT array_agg(p.transfer_id::text ORDER BY t.created_at, t.id) FROM reconciliation_resolution_postings p " +
   "JOIN transfers t ON t.id = p.transfer_id WHERE p.resolution_id = r.id), '{}') AS transfer_ids";
 
@@ -156,7 +167,8 @@ export async function resolveItem(
 
     const existing = await findResolution(c, "r.item_id = $1", [it.id]);
     if (existing) {
-      const same = existing.action === req.action && (existing.counterparty ?? undefined) === req.counterparty;
+      const same =
+        existing.action === req.action && (existing.counterparty ?? undefined) === req.counterparty && existing.cause === req.cause;
       if (!same) throw new ApiError(409, "already_resolved", "This item was already resolved differently.");
       return { resolution: existing, replayed: true };
     }
@@ -172,7 +184,7 @@ export async function resolveItem(
     }
 
     if (it.object_id) {
-      const table = it.object_type === "payout" ? "payouts" : "deposits";
+      const table = it.object_type === "payout" ? "payouts" : it.object_type === "order" ? "orders" : "deposits";
       await c.query(`SELECT 1 FROM ${table} WHERE id = $1 FOR UPDATE`, [it.object_id]);
     }
     const now = (await ledgerPositions(c, it.source, it.currency, it.break_key)).byKey.get(it.break_key) ?? { held: 0, settled: 0 };
@@ -192,8 +204,8 @@ export async function resolveItem(
     }
 
     const { rows: inserted } = await c.query<{ id: string }>(
-      `INSERT INTO reconciliation_resolutions (item_id, payout_id, break_key, fingerprint, action, counterparty, note, resolved_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      `INSERT INTO reconciliation_resolutions (item_id, payout_id, break_key, fingerprint, action, counterparty, cause, note, resolved_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING id`,
       [
         it.id,
         it.object_type === "payout" ? it.object_id : null,
@@ -201,6 +213,7 @@ export async function resolveItem(
         it.fingerprint,
         req.action,
         req.counterparty ?? null,
+        req.cause,
         req.note,
         req.resolved_by,
       ],
@@ -235,6 +248,15 @@ export async function resolveItem(
           resolutionId,
           transfer.id,
         ]);
+        // A correction that changes what an organizer is owed goes on their
+        // statement, with the person's cause and note, like any other line.
+        const organizer = (await organizerOfAccount(c, leg.from)) ?? (await organizerOfAccount(c, leg.to));
+        if (organizer) {
+          await recordOrganizerPosting(c, transfer.id, organizer.id, "reconciliation", `Reconciliation correction (${req.cause}): ${req.note}`, {
+            resolutionId,
+            payoutId: it.object_type === "payout" ? it.object_id : null,
+          });
+        }
       }
     }
 

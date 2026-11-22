@@ -33,12 +33,13 @@ const app = buildApp(pool, {
 for (const note of notes) app.log.warn(note);
 if (!process.env.ADMIN_TOKEN) app.log.warn("ADMIN_TOKEN not set: the admin API and dashboard are disabled");
 
-// The admin dashboard and the user wallet (React), once built with
-// `npm run dashboard:build` and `npm run wallet:build`.
+// The admin dashboard, the user wallet and the organizer portal (React), once built with
+// `npm run dashboard:build`, `npm run wallet:build` and `npm run portal:build`.
 const here = path.dirname(fileURLToPath(import.meta.url));
 for (const [name, dir] of [
   ["dashboard", "../dashboard/dist"],
   ["wallet", "../wallet/dist"],
+  ["portal", "../portal/dist"],
 ] as const) {
   const root = path.resolve(here, dir);
   if (!existsSync(root)) continue;

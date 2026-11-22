@@ -36,7 +36,7 @@ export async function listBreaks(pool: pg.Pool, { includeResolved = false } = {}
      )
      SELECT i.*, l.source,
             CASE WHEN r.id IS NULL THEN NULL ELSE json_build_object(
-              'id', r.id, 'action', r.action, 'counterparty', r.counterparty, 'note', r.note,
+              'id', r.id, 'action', r.action, 'counterparty', r.counterparty, 'cause', r.cause, 'note', r.note,
               'resolved_by', r.resolved_by, 'created_at', r.created_at) END AS resolution
        FROM reconciliation_items i
        JOIN latest l ON l.id = i.run_id
@@ -118,7 +118,7 @@ export async function traceBreakKey(pool: pg.Pool, breakKey: string) {
        FROM transfers t
        JOIN ledger_entries e ON e.transfer_id = t.id
        JOIN accounts a ON a.id = e.account_id
-      WHERE (t.idempotency_scope = 'system' AND $1 IN ('payout', 'deposit') AND split_part(t.idempotency_key, ':', 1) = $1
+      WHERE (t.idempotency_scope = 'system' AND $1 IN ('payout', 'deposit', 'order') AND split_part(t.idempotency_key, ':', 1) = $1
              AND split_part(t.idempotency_key, ':', 2) = $2)
          OR t.id IN (SELECT p.transfer_id FROM reconciliation_resolution_postings p
                        JOIN reconciliation_resolutions r ON r.id = p.resolution_id WHERE r.break_key = $3)

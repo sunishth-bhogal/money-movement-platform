@@ -6,6 +6,8 @@ import { ApiError } from "../errors.js";
 import { recordEventOnce } from "../ledger/events.js";
 import { createTransferInTx } from "../ledger/transfers.js";
 import { enqueueOutboxEvent } from "../outbox/outbox.js";
+import { applyDisputeEvent, DISPUTE_EVENTS, type DisputeEventType, type DisputeFields, type DisputeOutcome } from "../events/disputes.js";
+import { applyOrderCheckoutEvent, type OrderWebhookOutcome } from "../events/orderPayments.js";
 import type { CheckoutGateway } from "./stripe.js";
 
 export type DepositStatus =
@@ -128,8 +130,8 @@ export async function createDeposit(
   try {
     session = await gateway.createCheckoutSession(
       {
-        depositId: row.id,
-        amountCents: row.amount_cents,
+        reference: { type: "deposit", id: row.id },
+        lineItems: [{ name: "Account deposit (test mode)", unitAmountCents: row.amount_cents, quantity: 1 }],
         currency: row.currency,
         successUrl: returnUrl
           ? `${returnUrl}?deposit=${row.id}&checkout=success`
@@ -178,7 +180,16 @@ export type WebhookOutcome =
   | "duplicate" // this event id was already processed
   | "ignored" // not an event we act on, or not one of our deposits
   | "already_final" // the deposit had already reached a final state
-  | `deposit_${DepositStatus}`; // the deposit moved to this status
+  | `deposit_${DepositStatus}` // the deposit moved to this status
+  | OrderWebhookOutcome // the same, for a ticket order
+  | DisputeOutcome; // a chargeback on a ticket order
+
+export interface WebhookResult {
+  outcome: WebhookOutcome;
+  deposit_id?: string;
+  order_id?: string;
+  dispute_id?: string;
+}
 
 export type CheckoutSessionEvent =
   | "checkout.session.completed"
@@ -223,7 +234,7 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  *  3. The ledger transfer's idempotency key is `deposit:<id>`, and the
  *     database requires status = succeeded exactly when transfer_id is set.
  */
-export async function handleStripeEvent(pool: pg.Pool, event: Stripe.Event): Promise<{ outcome: WebhookOutcome; deposit_id?: string }> {
+export async function handleStripeEvent(pool: pg.Pool, event: Stripe.Event): Promise<WebhookResult> {
   return withTransaction(pool, async (client) => {
     const firstTime = await recordEventOnce(client, {
       provider: "stripe",
@@ -232,6 +243,9 @@ export async function handleStripeEvent(pool: pg.Pool, event: Stripe.Event): Pro
       payload: event,
     });
     if (!firstTime) return { outcome: "duplicate" };
+    if (DISPUTE_EVENTS.has(event.type)) {
+      return applyDisputeEvent(client, event.type as DisputeEventType, event.data.object as unknown as DisputeFields);
+    }
     if (!CHECKOUT_EVENTS.has(event.type)) return { outcome: "ignored" };
     return applyCheckoutSessionEvent(client, event.type as CheckoutSessionEvent, event.data.object as unknown as SessionFields);
   });
@@ -248,7 +262,9 @@ export async function applyCheckoutSessionEvent(
   client: pg.PoolClient,
   type: CheckoutSessionEvent,
   session: SessionFields,
-): Promise<{ outcome: WebhookOutcome; deposit_id?: string }> {
+): Promise<WebhookResult> {
+  // A ticket order's session, not a deposit's: same rules, its own postings.
+  if (session.metadata?.order_id) return applyOrderCheckoutEvent(client, type, session);
   const depositId = session.client_reference_id ?? session.metadata?.deposit_id;
   if (!depositId || !UUID_RE.test(depositId)) return { outcome: "ignored" };
 

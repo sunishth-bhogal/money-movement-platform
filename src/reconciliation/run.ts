@@ -29,7 +29,7 @@ export type ItemOutcome = "open" | "auto_resolved" | "in_transit" | "acknowledge
 
 export interface ReconItem extends Disagreement {
   break_key: string;
-  object_type: "payout" | "deposit";
+  object_type: "payout" | "deposit" | "order";
   object_id: string | null;
   account_id: string | null;
   provider_ref: string | null;
@@ -91,9 +91,11 @@ interface OurPayout {
   submit_event_id: string | null;
 }
 
+/** A deposit, or a ticket order: both are paid through a Stripe Checkout session. */
 interface OurDeposit {
+  type: "deposit" | "order";
   id: string;
-  account_id: string;
+  account_id: string | null;
   amount_cents: number;
   status: string;
   stripe_checkout_session_id: string | null;
@@ -337,18 +339,22 @@ async function compareBank(pool: pg.Pool, currency: string, statement: BankPayou
 async function compareStripe(pool: pg.Pool, currency: string, sessions: StripeSessionRecord[]): Promise<Compared> {
   const records = sessions.filter((s) => s.currency?.toUpperCase() === currency);
   const { rows: ours } = await pool.query<OurDeposit>(
-    "SELECT id, account_id, amount_cents, status, stripe_checkout_session_id FROM deposits WHERE currency = $1",
+    `SELECT 'deposit' AS type, id, account_id, amount_cents, status, stripe_checkout_session_id FROM deposits WHERE currency = $1
+     UNION ALL
+     SELECT 'order', id, NULL, amount_cents, status, stripe_checkout_session_id FROM orders WHERE currency = $1`,
     [currency],
   );
   const pairs = new Map<string, Pair<OurDeposit, StripeSessionRecord>>();
-  const byId = new Map(ours.map((d) => [d.id, d]));
-  for (const d of ours) pairs.set(objectBreakKey("stripe", d.id), { key: objectBreakKey("stripe", d.id), ours: d });
+  const byId = new Map(ours.map((d) => [`${d.type}:${d.id}`, d]));
+  const keyOf = (d: OurDeposit) => objectBreakKey("stripe", d.id, d.type);
+  for (const d of ours) pairs.set(keyOf(d), { key: keyOf(d), ours: d });
   for (const s of records) {
-    const depositId = s.client_reference_id ?? s.metadata?.deposit_id ?? "";
-    const deposit = byId.get(depositId);
-    // A session belongs to a deposit if it points at it and is the session we saved for it.
+    // Ticket orders carry order_id in their metadata; deposits, deposit_id (and both the id as client_reference_id).
+    const ref = s.metadata?.order_id ? `order:${s.metadata.order_id}` : `deposit:${s.client_reference_id ?? s.metadata?.deposit_id ?? ""}`;
+    const deposit = byId.get(ref);
+    // A session belongs to a deposit or order if it points at it and is the session we saved for it.
     const mine = deposit && (deposit.stripe_checkout_session_id === null || deposit.stripe_checkout_session_id === s.id);
-    const key = mine ? objectBreakKey("stripe", deposit.id) : `stripe_session:${s.id}`;
+    const key = mine ? keyOf(deposit) : `stripe_session:${s.id}`;
     const pair = pairs.get(key) ?? { key };
     if (pair.theirs) {
       // A second session pointing at the same deposit. Only one can be ours; keep the paid one.
@@ -379,7 +385,7 @@ async function compareStripe(pool: pg.Pool, currency: string, sessions: StripeSe
     }
     const base = {
       break_key: pair.key,
-      object_type: "deposit" as const,
+      object_type: pair.ours?.type ?? (pair.key.startsWith("order:") ? ("order" as const) : ("deposit" as const)),
       object_id: pair.ours?.id ?? null,
       account_id: pair.ours?.account_id ?? null,
       provider_ref: theirs?.id ?? null,
@@ -391,16 +397,21 @@ async function compareStripe(pool: pg.Pool, currency: string, sessions: StripeSe
     // own code path. If Stripe collected a different amount, that path puts
     // the deposit in requires_review instead, and the break stays open.
     if (pair.ours && theirs && DEPOSIT_OPEN.has(pair.ours.status) && theirs.payment_status === "paid") {
-      const depositId = pair.ours.id;
+      const { id: objectId, type } = pair.ours;
       const { outcome, status, transferIds, after } = await withTransaction(pool, async (c) => {
         await lockBreakKey(c, pair.key);
         const { outcome } = await applyCheckoutSessionEvent(c, "checkout.session.completed", toSessionFields(theirs));
-        const { rows } = await c.query<{ transfer_id: string | null; status: string }>(
-          "SELECT transfer_id, status FROM deposits WHERE id = $1",
-          [depositId],
+        const { rows } = await c.query<{ transfer_ids: string[]; status: string }>(
+          type === "deposit"
+            ? "SELECT CASE WHEN transfer_id IS NULL THEN '{}'::text[] ELSE ARRAY[transfer_id::text] END AS transfer_ids, status FROM deposits WHERE id = $1"
+            : `SELECT COALESCE((SELECT array_agg(t.id::text ORDER BY t.created_at, t.id) FROM transfers t
+                                 WHERE t.idempotency_scope = 'system' AND t.idempotency_key LIKE 'order:' || o.id || ':%'), '{}') AS transfer_ids,
+                      o.status
+                 FROM orders o WHERE o.id = $1`,
+          [objectId],
         );
         const after = (await ledgerPositions(c, "stripe", currency, pair.key)).byKey.get(pair.key) ?? { ...ZERO };
-        return { outcome, status: rows[0].status, transferIds: rows[0].transfer_id ? [rows[0].transfer_id] : [], after };
+        return { outcome, status: rows[0].status, transferIds: rows[0].transfer_ids, after };
       });
       if (samePosition(after, stripePosition(theirs))) {
         items.push(item(base, found, "auto_resolved", "stripe", `applied Stripe's paid session (${outcome})`, transferIds));

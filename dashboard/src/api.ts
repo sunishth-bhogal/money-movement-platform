@@ -84,6 +84,7 @@ export interface ResolutionSummary {
   id: string;
   action: string;
   counterparty: string | null;
+  cause: string | null;
   note: string;
   resolved_by: string;
   created_at: string;

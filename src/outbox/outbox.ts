@@ -2,7 +2,7 @@ import type pg from "pg";
 
 export interface NewOutboxEvent {
   eventType: string;
-  aggregateType: "transfer" | "deposit" | "payout" | "reconciliation";
+  aggregateType: "transfer" | "deposit" | "payout" | "reconciliation" | "order" | "refund" | "dispute" | "event" | "organizer";
   aggregateId: string;
   payload: unknown;
 }

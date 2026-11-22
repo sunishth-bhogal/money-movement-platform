@@ -3,6 +3,7 @@ import type pg from "pg";
 import { withTransaction } from "../db.js";
 import { ApiError } from "../errors.js";
 import { enqueueOutboxEvent } from "../outbox/outbox.js";
+import type { AccountKind } from "./accounts.js";
 
 export interface TransferRequest {
   from_account_id: string;
@@ -32,6 +33,14 @@ export type IdempotencyScope = "api" | "system";
 
 export interface TransferOptions {
   scope?: IdempotencyScope;
+  /**
+   * Refuse the transfer (status `rejected`, insufficient_funds) if it would
+   * take the source account below zero, whatever its kind. User and held
+   * organizer accounts always get this check; an organizer's available
+   * balance may go negative (a refund after payout), but never because of a
+   * payout, which passes this.
+   */
+  requireFunds?: boolean;
 }
 
 export interface TransferResult {
@@ -112,7 +121,7 @@ export async function createTransferInTx(
   client: pg.PoolClient,
   idempotencyKey: string,
   req: TransferRequest,
-  { scope = "api" }: TransferOptions = {},
+  { scope = "api", requireFunds = false }: TransferOptions = {},
 ): Promise<TransferResult> {
   if (req.from_account_id === req.to_account_id) {
     throw new ApiError(400, "same_account", "from_account_id and to_account_id must differ.");
@@ -129,7 +138,7 @@ export async function createTransferInTx(
   const { rows: accounts } = await client.query<{
     id: string;
     currency: string;
-    kind: "user" | "system";
+    kind: AccountKind;
     balance_cents: number;
   }>(
     `SELECT id, currency, kind, balance_cents
@@ -149,8 +158,10 @@ export async function createTransferInTx(
     throw new ApiError(403, "system_account_not_allowed", "Transfers may only move money between user accounts.");
   }
 
-  // 3. Funds check under lock. System accounts may go negative.
-  const insufficient = from.kind === "user" && from.balance_cents < req.amount_cents;
+  // 3. Funds check under lock. System accounts may go negative, and so may an
+  //    organizer's available balance (it is what they owe us), unless asked.
+  const mustCover = from.kind === "user" || from.kind === "organizer_held" || requireFunds;
+  const insufficient = mustCover && from.balance_cents < req.amount_cents;
   const status = insufficient ? "rejected" : "posted";
   const failureReason = insufficient ? "insufficient_funds" : null;
 
